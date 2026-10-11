@@ -27,7 +27,7 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import ResourceEditor, { singular, type ResourceKind } from './components/ResourceEditor';
 import SessionEditor from './components/SessionEditor';
-import { clearAuthToken, createInvitation, createVersion, currentUser, getPublishedWorkspace, getRemoteWorkspace, hasAuthToken, listUsers, listVersions, login, logout, publishVersion, register, requestPasswordReset, resetPassword, resetUserPassword, saveRemoteWorkspace, updateUserRole, verifyEmail, type AuthUser, type UserRole } from './api';
+import { clearAuthToken, createInvitation, createVersion, currentUser, generateAiSchedule, getPublishedWorkspace, getRemoteWorkspace, hasAuthToken, listUsers, listVersions, login, logout, publishVersion, register, requestPasswordReset, resetPassword, resetUserPassword, saveRemoteWorkspace, updateUserRole, verifyEmail, type AuthUser, type UserRole } from './api';
 import { createDemoData } from './seed';
 import { exportCsv, exportIcs, summarizeSchedule } from './scheduler';
 import {
@@ -128,6 +128,7 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
   const [sessionEditor, setSessionEditor] = useState<SessionEditorState>(null);
   const [notice, setNotice] = useState(initialWarning);
   const [generating, setGenerating] = useState(false);
+  const [aiGenerating, setAiGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
   const workerRef = useRef<Worker | null>(null);
   const importRef = useRef<HTMLInputElement>(null);
@@ -194,6 +195,26 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
       setNotice('The scheduler could not finish. Check your resources and try again.');
     };
     worker.postMessage({ data: workspace.data, lockedSessions: workspace.schedule?.sessions.filter(session => session.locked) ?? [] });
+  }
+
+  async function generateWithAi() {
+    if (aiGenerating || !canEdit) return;
+    if (!remote) {
+      setNotice('Sign in to a shared workspace to use the AI timetable planner.');
+      return;
+    }
+    setAiGenerating(true);
+    setNotice('OpenAI is proposing a timetable. ISchedule will validate it before saving…');
+    try {
+      const schedule = await generateAiSchedule(workspace.data, workspace.schedule);
+      persist({ ...workspace, schedule });
+      setPage('timetable');
+      setNotice(schedule.unscheduled.length ? 'AI timetable validated with a few sessions left for manual review.' : 'AI timetable generated and validated successfully.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'The AI timetable could not be generated.');
+    } finally {
+      setAiGenerating(false);
+    }
   }
 
   function saveResource(data: CollegeData) {
@@ -333,6 +354,7 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
           <div className="topbar-actions">
             <button className="button secondary topbar-backup" onClick={exportBackup}><Download size={16} /> Backup</button>
             {workspace.schedule && <button className="button secondary topbar-backup" onClick={exportCalendar}>ICS</button>}
+            {canEdit && <button className="button secondary" onClick={() => void generateWithAi()} disabled={aiGenerating || generating} title={remote ? 'Generate and validate a timetable with OpenAI' : 'AI planning requires a shared workspace'}><Sparkles size={16} /> {aiGenerating ? 'AI planning…' : 'AI plan'}</button>}
             <span className="account-chip"><span className="account-avatar">{user.name.split(' ').map(part => part[0]).slice(0, 2).join('')}</span><span><strong>{user.name}</strong><small>{user.role}</small></span></span>
             <button className="icon-button account-logout" onClick={() => void onLogout()} aria-label="Sign out" title="Sign out"><LogOut size={16} /></button>
             <button className="button primary" onClick={generate} disabled={!canEdit || generating || !workspace.data.courses.length}><Sparkles size={16} /> {generating ? `Generating ${progress}%` : 'Generate timetable'}</button>

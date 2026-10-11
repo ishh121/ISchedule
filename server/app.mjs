@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import nodemailer from 'nodemailer';
 import { parseWorkspace } from '../src/workspace.ts';
 import { createDemoData } from '../src/seed.ts';
+import { summarizeSchedule, validateSchedule } from '../src/scheduler.ts';
 
 const scrypt = promisify(scryptCallback);
 const roles = ['admin', 'planner', 'faculty', 'student', 'viewer'];
@@ -83,6 +84,9 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
   const loginAttempts = new Map();
   const audit = (user, action, details = {}) => db.prepare('INSERT INTO audit(actor,action,details,createdAt) VALUES(?,?,?,?)').run(user?.email || 'system', action, JSON.stringify(details), new Date().toISOString());
   const mailTransport = process.env.SMTP_HOST ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: Number(process.env.SMTP_PORT || 587) === 465, auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD } : undefined }) : null;
+  const openAiKey = process.env.OPENAI_API_KEY;
+  const openAiModel = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  const openAiBaseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
   const sendMail = async (to, subject, textBody) => {
     if (!mailTransport || !process.env.MAIL_FROM) { console.log(`Mail (${subject}) for ${to}: ${textBody}`); return; }
     await mailTransport.sendMail({ from: process.env.MAIL_FROM, to, subject, text: textBody });
@@ -107,6 +111,73 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     } catch (error) { db.exec('ROLLBACK'); throw error; }
     audit(user, 'workspace.saved', { revision: revision + 1 });
     return { workspace: parsed, revision: revision + 1 };
+  }
+  async function createAiSchedule(workspace, user) {
+    if (!openAiKey) throw httpError(503, 'AI planning is not configured. Add OPENAI_API_KEY to the server environment.');
+    let parsed;
+    try { parsed = parseWorkspace(JSON.stringify(workspace)); }
+    catch (error) { throw httpError(400, error.message); }
+    const { data, schedule } = parsed;
+    const lockedSessions = schedule?.sessions.filter(session => session.locked) || [];
+    const prompt = {
+      data,
+      lockedSessions,
+      instructions: [
+        'Create a complete weekly timetable for every requested course session.',
+        'Return only JSON with a sessions array. Do not include markdown or explanations.',
+        'Each session must contain id, courseId, day, period, roomId, and optional locked boolean.',
+        'Use only IDs from the supplied data. Days and periods are zero-based.',
+        'Each course can meet at most once per day. Multi-period courses must use contiguous periods and cannot cross breaks.',
+        'Preserve every locked session exactly, including its id, day, period, roomId, and locked=true.',
+      ],
+    };
+    let response;
+    try {
+      response = await fetch(`${openAiBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${openAiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: openAiModel,
+          temperature: 0.15,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: 'You are the ISchedule timetable planning engine. Produce valid structured timetable data and follow the supplied constraints exactly.' },
+            { role: 'user', content: JSON.stringify(prompt) },
+          ],
+        }),
+        signal: AbortSignal.timeout(60_000),
+      });
+    } catch (error) {
+      throw httpError(502, error instanceof Error ? `The AI service could not be reached: ${error.message}` : 'The AI service could not be reached.');
+    }
+    if (!response.ok) throw httpError(502, `The AI service rejected the timetable request (${response.status}).`);
+    let body;
+    try { body = await response.json(); }
+    catch { throw httpError(502, 'The AI service returned an unreadable response.'); }
+    const content = body?.choices?.[0]?.message?.content;
+    if (typeof content !== 'string') throw httpError(502, 'The AI service returned no timetable.');
+    let result;
+    try { result = JSON.parse(content); }
+    catch { throw httpError(502, 'The AI service returned invalid timetable JSON.'); }
+    if (!Array.isArray(result?.sessions) || result.sessions.length > 2500) throw httpError(502, 'The AI service returned an invalid session list.');
+    const sessions = result.sessions.map(session => ({
+      id: session?.id,
+      courseId: session?.courseId,
+      day: session?.day,
+      period: session?.period,
+      roomId: session?.roomId,
+      ...(session?.locked === true ? { locked: true } : {}),
+    }));
+    if (sessions.some(session => !text(session.id) || !text(session.courseId) || !text(session.roomId) || !Number.isInteger(session.day) || !Number.isInteger(session.period) || (session.locked !== undefined && session.locked !== true))) throw httpError(502, 'The AI service returned malformed timetable sessions.');
+    const issues = validateSchedule(data, sessions);
+    if (issues.length) throw httpError(502, `The AI proposed an invalid timetable: ${issues[0].message}`);
+    for (const locked of lockedSessions) {
+      const candidate = sessions.find(session => session.id === locked.id);
+      if (!candidate || candidate.courseId !== locked.courseId || candidate.day !== locked.day || candidate.period !== locked.period || candidate.roomId !== locked.roomId || candidate.locked !== true) throw httpError(502, 'The AI changed a locked session. Try again or use the deterministic planner.');
+    }
+    const planned = summarizeSchedule(data, sessions);
+    audit(user, 'workspace.ai_plan_generated', { model: openAiModel, placed: sessions.length, unscheduled: planned.unscheduled.reduce((total, item) => total + item.count, 0) });
+    return planned;
   }
   function token(request) {
     const entry = (request.headers.cookie || '').split(';').map(value => value.trim()).find(value => value.startsWith(`${cookieName}=`));
@@ -255,6 +326,11 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       requireRole(user, ['admin', 'planner']);
       const value = await readBody(request);
       return send(response, 200, save(value.workspace, value.revision, user));
+    }
+    if (path === '/api/ai/plan' && request.method === 'POST') {
+      requireRole(user, ['admin', 'planner']);
+      const value = await readBody(request);
+      return send(response, 200, { schedule: await createAiSchedule(value.workspace, user) });
     }
     if (path === '/api/availability' && request.method === 'PUT') {
       requireRole(user, ['faculty']);

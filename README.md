@@ -24,6 +24,8 @@ npm start
 
 The server serves the built frontend and API from port `4174`. Configure `PUBLIC_ORIGIN=https://your-domain.example` behind an HTTPS reverse proxy. Store the SQLite database outside the application directory with `ISCHEDULE_DATA_DIR`.
 
+To enable the AI timetable planner, configure `OPENAI_API_KEY` on the server. The key is never sent to the browser. `OPENAI_MODEL` defaults to `gpt-4o-mini`; the AI proposes placements and the server validates every placement against ISchedule's hard constraints before accepting it.
+
 Docker is also supported:
 
 ```bash

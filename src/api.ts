@@ -1,4 +1,4 @@
-import type { SavedWorkspace } from './types';
+import type { CollegeData, SavedWorkspace, ScheduleResult } from './types';
 
 export type UserRole = 'admin' | 'planner' | 'faculty' | 'student' | 'viewer';
 export interface AuthUser { id: string; name: string; email: string; role: UserRole; facultyId?: string | null; groupId?: string | null; createdAt?: string }
@@ -31,6 +31,9 @@ export async function logout() { try { await request('/api/auth/logout', { metho
 export async function getRemoteWorkspace() { return request<{ workspace: SavedWorkspace; revision: number }>('/api/workspace'); }
 export async function getPublishedWorkspace() { return (await request<{ version: { payload: SavedWorkspace } | null }>('/api/published')).version?.payload ?? null; }
 export async function saveRemoteWorkspace(workspace: SavedWorkspace, revision: number) { return request<{ workspace: SavedWorkspace; revision: number }>('/api/workspace', { method: 'PUT', body: JSON.stringify({ workspace, revision }) }); }
+export async function generateAiSchedule(data: CollegeData, schedule: ScheduleResult | null) {
+  return (await request<{ schedule: ScheduleResult }>('/api/ai/plan', { method: 'POST', body: JSON.stringify({ workspace: { version: 1, data, schedule } }) })).schedule;
+}
 export async function listUsers() { return (await request<{ users: AuthUser[] }>('/api/users')).users; }
 export async function updateUserRole(id: string, role: UserRole, facultyId?: string, groupId?: string) { return (await request<{ user: AuthUser }>(`/api/users/${id}`, { method: 'PUT', body: JSON.stringify({ role, facultyId, groupId }) })).user; }
 export async function resetUserPassword(id: string, password: string) { await request(`/api/users/${id}/reset-password`, { method: 'POST', body: JSON.stringify({ password }) }); }

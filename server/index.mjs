@@ -1,6 +1,8 @@
 import { resolve } from 'node:path';
 import { createApplication } from './app.mjs';
 
+try { process.loadEnvFile?.('.env'); } catch { /* Environment variables may be supplied by the host. */ }
+
 const port = Number(process.env.PORT || 4174);
 const host = process.env.HOST || '127.0.0.1';
 const { server, close } = createApplication({

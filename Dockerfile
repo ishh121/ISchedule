@@ -8,6 +8,8 @@ ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=4174
 ENV ISCHEDULE_DATA_DIR=/data
+ENV OPENAI_MODEL=gpt-4o-mini
+ENV OPENAI_BASE_URL=https://api.openai.com/v1
 VOLUME ["/data"]
 EXPOSE 4174
 CMD ["node", "dist-server/index.mjs"]
