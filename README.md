@@ -24,7 +24,7 @@ npm start
 
 The server serves the built frontend and API from port `4174`. Configure `PUBLIC_ORIGIN=https://your-domain.example` behind an HTTPS reverse proxy. Store the SQLite database outside the application directory with `ISCHEDULE_DATA_DIR`.
 
-To enable the AI timetable planner, configure `OPENAI_API_KEY` on the server. The key is never sent to the browser. `OPENAI_MODEL` defaults to `gpt-4o-mini`; the AI proposes placements and the server validates every placement against ISchedule's hard constraints before accepting it.
+The AI timetable planner uses Ollama locally by default (`llama3.2:3b` at `http://127.0.0.1:11434/v1`), so it does not require paid API credits. Install Ollama, run `ollama pull llama3.2:3b`, and configure `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_API_KEY=ollama` on the server. The key is never sent to the browser. The AI proposes placements and the server validates every placement against ISchedule's hard constraints before accepting it.
 
 Docker is also supported:
 
