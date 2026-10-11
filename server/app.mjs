@@ -150,7 +150,15 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     } catch (error) {
       throw httpError(502, error instanceof Error ? `The AI service could not be reached: ${error.message}` : 'The AI service could not be reached.');
     }
-    if (!response.ok) throw httpError(502, `The AI service rejected the timetable request (${response.status}).`);
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const errorBody = await response.json();
+        detail = typeof errorBody?.error?.message === 'string' ? errorBody.error.message : '';
+      } catch { /* The provider may return a non-JSON error response. */ }
+      if (response.status === 429) throw httpError(429, detail ? `OpenAI rate limit or billing quota reached: ${detail}` : 'OpenAI rate limit or billing quota reached. Check API billing, usage limits, and rate limits.');
+      throw httpError(502, detail ? `The AI service rejected the timetable request: ${detail}` : `The AI service rejected the timetable request (${response.status}).`);
+    }
     let body;
     try { body = await response.json(); }
     catch { throw httpError(502, 'The AI service returned an unreadable response.'); }
