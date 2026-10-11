@@ -210,7 +210,14 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     response.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' http://127.0.0.1:4174 http://127.0.0.1:5173 http://localhost:4174 http://localhost:5173; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; script-src 'self'");
     if (publicOrigin?.startsWith('https://')) response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     const origin = request.headers.origin;
-    const allowedOrigin = publicOrigin || (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ? origin : `http://${request.headers.host}`);
+    const localOrigin = value => {
+      try { return ['localhost', '127.0.0.1'].includes(new URL(value).hostname); }
+      catch { return false; }
+    };
+    // Vite runs on 5173 while the development API runs on 4174. Allow both
+    // local origins during development, while keeping production strict.
+    const isLocalDevelopmentOrigin = process.env.NODE_ENV !== 'production' && origin && publicOrigin && localOrigin(origin) && localOrigin(publicOrigin);
+    const allowedOrigin = publicOrigin && !isLocalDevelopmentOrigin ? publicOrigin : (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ? origin : `http://${request.headers.host}`);
     if (origin && origin !== allowedOrigin) throw httpError(403, 'Request origin is not allowed.');
     if (origin) {
       response.setHeader('Access-Control-Allow-Origin', allowedOrigin);
