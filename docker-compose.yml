@@ -1,0 +1,21 @@
+services:
+  ischedule:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "4174:4174"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4174
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:4174}
+      ISCHEDULE_DATA_DIR: /data
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+    volumes:
+      - ischedule-data:/data
+volumes:
+  ischedule-data:
