@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createDemoData } from '../src/seed';
+import { createDemoData } from './fixtures/demo';
 import { contiguous, exportCsv, exportIcs, facultyDailyLoads, facultyLoadPenalty, generateSchedule, placementIssues, scorePlacement, validateSchedule } from '../src/scheduler';
 import type { Session } from '../src/types';
 

@@ -19,7 +19,7 @@ The development command starts the API at `http://127.0.0.1:4174` and Vite at `h
 
 ## Workspaces and roles
 
-An online workspace is shared through the server and stored in SQLite. A local workspace is stored in the current browser and is useful for trying the scheduler or preparing a draft without changing shared data.
+An online workspace is shared through the server and stored in SQLite. A local workspace is stored in the current browser and is useful for trying the scheduler or preparing a draft without changing shared data. New local and online workspaces start empty; add or import the resources for the term before generating a timetable.
 
 | Role | Access |
 | --- | --- |
@@ -82,7 +82,7 @@ ollama pull llama3.2:3b
 OPENAI_BASE_URL=http://127.0.0.1:11434/v1 OPENAI_MODEL=llama3.2:3b OPENAI_API_KEY=ollama npm start
 ```
 
-The key is never sent to the browser. The AI supplies a planning order and ISchedule validates and generates the final placement against hard constraints. Paid model switching is not part of the documented workflow or browser test path; keep model checks on localhost Ollama.
+The key is never sent to the browser. The AI supplies a planning order using a strict JSON schema limited to the workspace's exact course IDs, not course codes. ISchedule still rejects unknown or duplicate IDs and generates the final placement against hard constraints. Paid model switching is not part of the documented workflow or browser test path; keep model checks on localhost Ollama.
 
 Docker is also supported:
 
@@ -107,6 +107,8 @@ npm run test:ollama -- --app-flow     # optional isolated app AI flow; requires 
 ```
 
 Vitest includes only `tests/**/*.test.ts` and excludes `e2e/**`. Playwright serves the production `dist/` bundle through `scripts/e2e-server.mjs` on `127.0.0.1:4180`. Each run creates a fresh operating-system temporary data directory, disables SMTP and model credentials, and removes the database when the server stops; it never uses `server/data` or real accounts. The optional Ollama app flow uses another temporary database, a `.invalid` test account, and localhost only.
+
+The Ollama chat check allows 90 seconds for CPU model loading. The optional app check allows 75 seconds for the server's 60-second AI request and confirms the requested course is placed with its exact ID. A reachable `/api/version` endpoint alone does not prove that AI planning works; run `npm run test:ollama -- --app-flow` after rebuilding the server.
 
 CI runs the unit tests, production build, Chromium setup, and isolated browser suite. If the browser binary is not available locally, install it with the command above; do not interpret an unrun browser suite as passing.
 

@@ -1,6 +1,5 @@
 import { COLORS, DAYS, PERIODS, type AcademicTerm, type CollegeData, type SavedWorkspace, type Session } from './types';
 import { summarizeSchedule, validateSchedule } from './scheduler';
-import { createDemoData } from './seed';
 
 export const STORAGE_KEY = 'ischedule.workspace.v1';
 const LEGACY_STORAGE_KEY = 'campusly.workspace.v1';
@@ -8,6 +7,28 @@ const object = (value: unknown): value is Record<string, unknown> => typeof valu
 const text = (value: unknown, max = 200) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
 const integer = (value: unknown, min: number, max: number) => typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
 const roomType = (value: unknown) => value === 'lecture' || value === 'lab';
+
+export function createEmptyWorkspace(): SavedWorkspace {
+  return {
+    version: 1,
+    data: {
+      courses: [],
+      faculty: [],
+      rooms: [],
+      groups: [],
+      preferences: {
+        days: [0, 1, 2, 3, 4],
+        preferMorning: true,
+        balancedDays: true,
+        avoidLastPeriod: true,
+        avoidGaps: false,
+        avoidFirstPeriod: false,
+        balanceFacultyLoad: false,
+      },
+    },
+    schedule: null,
+  };
+}
 
 function validIsoDate(value: unknown): value is string {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -93,13 +114,21 @@ export function parseWorkspace(raw: string): SavedWorkspace {
 }
 
 export function loadWorkspace(): { workspace: SavedWorkspace; warning: string } {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
-    if (raw) return { workspace: parseWorkspace(raw), warning: '' };
-  } catch {
-    return { workspace: { version: 1, data: createDemoData(), schedule: null }, warning: 'Your saved workspace could not be read. Sample data is loaded; use a JSON backup to restore your work.' };
+  let hadSavedData = false;
+  for (const key of [STORAGE_KEY, LEGACY_STORAGE_KEY]) {
+    const raw = localStorage.getItem(key);
+    if (!raw) continue;
+    hadSavedData = true;
+    try {
+      return { workspace: parseWorkspace(raw), warning: '' };
+    } catch {
+      // Try the legacy key before reporting that saved data could not be read.
+    }
   }
-  return { workspace: { version: 1, data: createDemoData(), schedule: null }, warning: '' };
+  return {
+    workspace: createEmptyWorkspace(),
+    warning: hadSavedData ? 'Your saved workspace could not be read. Import a valid JSON backup to restore your work.' : '',
+  };
 }
 
 export function downloadFile(content: string, name: string, type: string) {

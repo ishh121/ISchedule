@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createDemoData } from '../src/seed';
+import { createDemoData } from './fixtures/demo';
 import { csvTemplate, previewCsvImport } from '../src/csv';
 
 describe('resource CSV import', () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { exportSemesterIcs } from '../src/calendar';
-import { createDemoData } from '../src/seed';
+import { createDemoData } from './fixtures/demo';
 import type { AcademicTerm, Session } from '../src/types';
 
 const term: AcademicTerm = {

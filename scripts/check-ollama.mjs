@@ -8,6 +8,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const model = process.env.OLLAMA_MODEL || process.env.OPENAI_MODEL || 'llama3.2:3b';
 const timeout = 20_000;
+// Loading a local model on CPU can exceed the ordinary service startup timeout.
+const modelTimeout = 90_000;
+const appTimeout = 75_000;
 
 function localBase(value) {
   let url;
@@ -22,16 +25,22 @@ function localBase(value) {
   return url.toString().replace(/\/$/, '');
 }
 
-async function jsonRequest(url, options, label) {
+async function jsonRequest(url, options, label, requestTimeout = timeout) {
   let response;
   try {
-    response = await fetch(url, { ...options, signal: AbortSignal.timeout(timeout) });
+    response = await fetch(url, { ...options, signal: AbortSignal.timeout(requestTimeout) });
   } catch (error) {
+    const timedOut = error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name);
+    if (timedOut) throw new Error(`${label} timed out after ${requestTimeout / 1000} seconds. The local model may still be loading or processing the request.`);
     throw new Error(`${label} could not be reached. Is Ollama running locally? (${error instanceof Error ? error.message : 'network error'})`);
   }
   const body = await response.text();
   if (!response.ok) {
-    if (label === 'ISchedule AI flow' && response.status === 502) throw new Error(`${label} returned HTTP 502 after Ollama answered. The app rejected the model output; use a model that follows JSON instructions or inspect the server log.`);
+    if (label === 'ISchedule AI flow') {
+      let detail = '';
+      try { const parsed = JSON.parse(body); if (typeof parsed?.error === 'string') detail = `: ${parsed.error}`; } catch { /* A failed app response may not be JSON. */ }
+      throw new Error(`${label} returned HTTP ${response.status}${detail}`);
+    }
     throw new Error(`${label} returned HTTP ${response.status}.`);
   }
   try { return JSON.parse(body); } catch { throw new Error(`${label} returned non-JSON data.`); }
@@ -90,8 +99,9 @@ async function runAppFlow(ollamaRoot) {
     if (!registration.ok) throw new Error(`The isolated app registration returned HTTP ${registration.status}.`);
     const cookie = registration.headers.get('set-cookie')?.split(';', 1)[0];
     if (!cookie) throw new Error('The isolated app did not return a session cookie.');
-    const result = await jsonRequest(`${base}/api/ai/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ workspace: appWorkspace() }) }, 'ISchedule AI flow');
+    const result = await jsonRequest(`${base}/api/ai/plan`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ workspace: appWorkspace() }) }, 'ISchedule AI flow', appTimeout);
     if (!Array.isArray(result?.schedule?.sessions) || typeof result.schedule.generatedAt !== 'string') throw new Error('ISchedule AI flow returned no validated schedule.');
+    if (result.schedule.sessions.length !== 1 || result.schedule.sessions[0].courseId !== 'e2e-course' || result.schedule.unscheduled?.length !== 0) throw new Error('ISchedule AI flow did not place the requested course using its exact ID.');
   } finally {
     if (child.exitCode === null) child.kill('SIGTERM');
     if (child.exitCode === null) await new Promise(resolveClose => child.once('close', resolveClose));
@@ -109,7 +119,7 @@ async function main() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ollama' },
     body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply with exactly OK.' }], temperature: 0, max_tokens: 8 }),
-  }, 'Ollama OpenAI-compatible chat');
+  }, 'Ollama OpenAI-compatible chat', modelTimeout);
   const content = completion?.choices?.[0]?.message?.content;
   if (typeof content !== 'string' || !content.trim()) throw new Error('Ollama OpenAI-compatible chat returned no assistant content.');
   console.log(`OpenAI-compatible chat responded using model ${model}.`);
@@ -125,7 +135,7 @@ try {
   await main();
 } catch (error) {
   console.error(`Ollama check failed: ${error instanceof Error ? error.message : 'unexpected error'}`);
-  if (process.argv.includes('--app-flow')) console.error('If the two base checks passed, Ollama is reachable; inspect the isolated app response and use a model that follows the requested JSON format.');
+  if (process.argv.includes('--app-flow')) console.error('If the two base checks passed, Ollama is reachable; use the app error above to diagnose the planning failure.');
   else console.error(`Try "ollama serve" and "ollama pull ${model}", then rerun npm run test:ollama.`);
   process.exitCode = 1;
 }

@@ -1,5 +1,6 @@
-import type { CollegeData, Color, Course } from './types';
+import type { CollegeData, Color, Course } from '../../src/types';
 
+// Deterministic test data only. Production workspaces must never import this fixture.
 const subjects: { name: string; code: string; faculty: string; sessions: number; color: Color; lab?: boolean }[] = [
   { name: 'Data Structures', code: 'CS201', faculty: 'f1', sessions: 3, color: 'sage' },
   { name: 'Database Systems', code: 'CS202', faculty: 'f2', sessions: 3, color: 'lavender' },

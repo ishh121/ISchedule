@@ -5,8 +5,7 @@ import { extname, resolve, sep, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 import nodemailer from 'nodemailer';
-import { parseWorkspace } from '../src/workspace.ts';
-import { createDemoData } from '../src/seed.ts';
+import { createEmptyWorkspace, parseWorkspace } from '../src/workspace.ts';
 import { generateSchedule, summarizeSchedule } from '../src/scheduler.ts';
 
 const scrypt = promisify(scryptCallback);
@@ -108,12 +107,12 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     try { legacy = JSON.parse(readFileSync(legacyFile, 'utf8')); } catch { legacy = null; }
   }
   if (!db.prepare('SELECT id FROM workspaces WHERE id=1').get()) {
-    let workspace = { version: 1, data: createDemoData(), schedule: null };
+    let workspace = createEmptyWorkspace();
     const old = db.prepare('SELECT revision,payload FROM workspace WHERE id=1').get();
     if (old?.payload) {
-      try { workspace = parseWorkspace(old.payload); } catch { /* The demo workspace is safer than an invalid legacy payload. */ }
+      try { workspace = parseWorkspace(old.payload); } catch { /* Preserve the legacy row and start the new store empty. */ }
     } else if (legacy?.workspace) {
-      try { workspace = parseWorkspace(JSON.stringify(legacy.workspace)); } catch { /* Keep the valid demo fallback. */ }
+      try { workspace = parseWorkspace(JSON.stringify(legacy.workspace)); } catch { /* Preserve the legacy file and start the new store empty. */ }
     }
     const now = new Date().toISOString();
     const payload = JSON.stringify(workspace);
@@ -191,8 +190,24 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     try { parsed = parseWorkspace(JSON.stringify(workspace)); }
     catch (error) { throw httpError(400, error.message); }
     const { data, schedule } = parsed;
+    if (!data.courses.length) throw httpError(400, 'Add at least one course before using AI planning.');
+    const courseIds = data.courses.map(course => course.id);
+    const responseSchema = {
+      type: 'object',
+      properties: {
+        courseOrder: {
+          type: 'array',
+          items: { type: 'string', enum: courseIds },
+          minItems: courseIds.length,
+          maxItems: courseIds.length,
+        },
+      },
+      required: ['courseOrder'],
+      additionalProperties: false,
+    };
     const lockedSessions = schedule?.sessions.filter(session => session.locked) || [];
     const prompt = {
+      allowedCourseIds: courseIds,
       data: {
         courses: data.courses,
         faculty: data.faculty.map(member => ({ id: member.id, maxDailyPeriods: member.maxDailyPeriods, unavailable: member.unavailable })),
@@ -205,6 +220,7 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
         'Rank the courses in the order they should be planned, placing the most constrained courses first.',
         'Return only JSON with a courseOrder array. Do not include markdown, explanations, sessions, or time placements.',
         'courseOrder must contain every course ID exactly once and must use only IDs from the supplied data.',
+        'Copy the exact courses[].id values from allowedCourseIds, not course codes (courses[].code), names, or invented identifiers.',
         'Consider weekly sessions, duration, room type and features, group size, faculty availability, daily limits, teaching days, and locked sessions.',
       ],
     };
@@ -215,9 +231,9 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
         headers: { Authorization: `Bearer ${openAiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: openAiModel,
-          temperature: 0.15,
+          temperature: 0,
           max_tokens: 1000,
-          response_format: { type: 'json_object' },
+          response_format: { type: 'json_schema', json_schema: { name: 'course_priority', strict: true, schema: responseSchema } },
           messages: [
             { role: 'system', content: 'You are the ISchedule timetable planning engine. Produce valid structured timetable data and follow the supplied constraints exactly.' },
             { role: 'user', content: JSON.stringify(prompt) },
@@ -459,7 +475,7 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       const sourceId = value.sourceWorkspaceId === undefined || value.sourceWorkspaceId === null ? null : Number(value.sourceWorkspaceId);
       if (sourceId !== null && (!Number.isSafeInteger(sourceId) || sourceId < 1)) throw httpError(400, 'sourceWorkspaceId must be a positive integer.');
       const source = sourceId === null ? null : load(sourceId).workspace;
-      let workspace = source ? { ...source, data: source.data, schedule: value.copySchedule === true ? source.schedule : null } : { version: 1, data: createDemoData(), schedule: null };
+      let workspace = source ? { ...source, data: source.data, schedule: value.copySchedule === true ? source.schedule : null } : createEmptyWorkspace();
       if (value.term !== undefined) workspace = { ...workspace, term: value.term };
       let parsed;
       try { parsed = parseWorkspace(JSON.stringify(workspace)); } catch (error) { throw httpError(400, error.message); }
