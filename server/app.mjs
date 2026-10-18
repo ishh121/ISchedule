@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import nodemailer from 'nodemailer';
 import { parseWorkspace } from '../src/workspace.ts';
 import { createDemoData } from '../src/seed.ts';
-import { summarizeSchedule, validateSchedule } from '../src/scheduler.ts';
+import { generateSchedule, summarizeSchedule } from '../src/scheduler.ts';
 
 const scrypt = promisify(scryptCallback);
 const roles = ['admin', 'planner', 'faculty', 'student', 'viewer'];
@@ -17,8 +17,18 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const text = (value, max = 200) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
 const emailValid = value => text(value, 160) && /^\S+@\S+\.\S+$/.test(value);
 const passwordValid = value => typeof value === 'string' && value.length >= 8 && value.length <= 200;
-const publicUser = user => ({ id: user.id, name: user.name, email: user.email, role: user.role, facultyId: user.facultyId, groupId: user.groupId, active: Boolean(user.active ?? 1), emailVerified: Boolean(user.emailVerified ?? 0) });
+const publicUser = (user, link = {}) => ({
+  id: user.id,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  facultyId: link.facultyId ?? null,
+  groupId: link.groupId ?? null,
+  active: Boolean(user.active ?? 1),
+  emailVerified: Boolean(user.emailVerified ?? 0),
+});
 const httpError = (status, message) => Object.assign(new Error(message), { status });
+const slotPattern = /^[0-4]-[0-6]$/;
 
 async function encodePassword(password) {
   const salt = randomBytes(16).toString('hex');
@@ -64,71 +74,138 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     CREATE TABLE IF NOT EXISTS invitations (token TEXT PRIMARY KEY, email TEXT NOT NULL, role TEXT NOT NULL, facultyId TEXT, groupId TEXT, expires INTEGER NOT NULL, usedBy TEXT);
     CREATE TABLE IF NOT EXISTS workspace_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0, createdBy TEXT NOT NULL, createdAt TEXT NOT NULL);
   `);
-  try { db.exec('ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1'); } catch { /* Existing databases already have the column. */ }
-  try { db.exec('ALTER TABLE users ADD COLUMN emailVerified INTEGER NOT NULL DEFAULT 0'); } catch { /* Existing databases already have the column. */ }
-  if (!db.prepare('SELECT id FROM workspace WHERE id=1').get()) {
-    let workspace = { version: 1, data: createDemoData(), schedule: null };
-    // Preserve accounts/data created by the earlier JSON-storage version.
-    const legacyFile = dataDirectory && join(dataDirectory, 'store.json');
-    const legacy = legacyFile && existsSync(legacyFile) ? JSON.parse(readFileSync(legacyFile, 'utf8')) : null;
-    if (legacy?.workspace) workspace = parseWorkspace(JSON.stringify(legacy.workspace));
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const user of legacy?.users || []) {
-        db.prepare('INSERT INTO users(id,name,email,role,passwordHash,active) VALUES(?,?,?,?,?,1)').run(user.id, user.name, user.email, roles.includes(user.role) ? user.role : 'student', user.passwordHash);
-      }
-      db.prepare('INSERT INTO workspace VALUES(1,0,?)').run(JSON.stringify(workspace));
-      db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  const columns = table => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+  const addColumn = (table, column, definition) => { if (!columns(table).has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`); };
+  addColumn('users', 'active', 'INTEGER NOT NULL DEFAULT 1');
+  addColumn('users', 'emailVerified', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('workspace_versions', 'workspaceId', 'INTEGER NOT NULL DEFAULT 1');
+  addColumn('audit', 'workspaceId', 'INTEGER NOT NULL DEFAULT 1');
+  addColumn('invitations', 'workspaceId', 'INTEGER NOT NULL DEFAULT 1');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, term TEXT,
+      revision INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL,
+      createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS user_workspace_links (
+      userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      workspaceId INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      facultyId TEXT, groupId TEXT, PRIMARY KEY(userId, workspaceId)
+    );
+    CREATE TABLE IF NOT EXISTS workspace_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      workspaceId INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL, payload TEXT NOT NULL, actor TEXT NOT NULL, savedAt TEXT NOT NULL,
+      UNIQUE(workspaceId, revision)
+    );
+    CREATE INDEX IF NOT EXISTS workspace_versions_scope ON workspace_versions(workspaceId, id);
+    CREATE INDEX IF NOT EXISTS audit_scope ON audit(workspaceId, id);
+  `);
+  // Preserve accounts/data created by the earlier JSON-storage and single-row SQLite versions.
+  let legacy = null;
+  const legacyFile = dataDirectory && join(dataDirectory, 'store.json');
+  if (legacyFile && existsSync(legacyFile)) {
+    try { legacy = JSON.parse(readFileSync(legacyFile, 'utf8')); } catch { legacy = null; }
   }
+  if (!db.prepare('SELECT id FROM workspaces WHERE id=1').get()) {
+    let workspace = { version: 1, data: createDemoData(), schedule: null };
+    const old = db.prepare('SELECT revision,payload FROM workspace WHERE id=1').get();
+    if (old?.payload) {
+      try { workspace = parseWorkspace(old.payload); } catch { /* The demo workspace is safer than an invalid legacy payload. */ }
+    } else if (legacy?.workspace) {
+      try { workspace = parseWorkspace(JSON.stringify(legacy.workspace)); } catch { /* Keep the valid demo fallback. */ }
+    }
+    const now = new Date().toISOString();
+    const payload = JSON.stringify(workspace);
+    db.prepare('INSERT INTO workspaces(id,name,term,revision,payload,createdAt,updatedAt) VALUES(1,?,?,?,?,?,?)').run('Workspace 1', workspace.term ? JSON.stringify(workspace.term) : null, old?.revision ?? 0, payload, now, now);
+    if (!old) db.prepare('INSERT OR IGNORE INTO workspace(id,revision,payload) VALUES(1,?,?)').run(old?.revision ?? 0, payload);
+  }
+  for (const account of legacy?.users || []) {
+    if (!account?.id || !account?.passwordHash || !emailValid(account.email)) continue;
+    db.prepare('INSERT OR IGNORE INTO users(id,name,email,role,passwordHash,active) VALUES(?,?,?,?,?,?)').run(account.id, account.name || account.email, account.email.trim().toLowerCase(), roles.includes(account.role) ? account.role : 'student', account.passwordHash, account.active === false ? 0 : 1);
+  }
+  db.prepare(`INSERT OR IGNORE INTO workspace_history(workspaceId,revision,payload,actor,savedAt)
+    SELECT 1,revision,payload,actor,savedAt FROM history`).run();
+  db.prepare(`INSERT OR IGNORE INTO user_workspace_links(userId,workspaceId,facultyId,groupId)
+    SELECT id,1,facultyId,groupId FROM users WHERE facultyId IS NOT NULL OR groupId IS NOT NULL`).run();
+  // Existing invitations and versions belong to the migrated workspace 1 through their default column.
+  db.prepare('UPDATE workspace_versions SET workspaceId=1 WHERE workspaceId IS NULL').run();
+  db.prepare('UPDATE audit SET workspaceId=1 WHERE workspaceId IS NULL').run();
+  db.prepare('UPDATE invitations SET workspaceId=1 WHERE workspaceId IS NULL').run();
   const loginAttempts = new Map();
-  const audit = (user, action, details = {}) => db.prepare('INSERT INTO audit(actor,action,details,createdAt) VALUES(?,?,?,?)').run(user?.email || 'system', action, JSON.stringify(details), new Date().toISOString());
+  const audit = (user, action, details = {}, workspaceId = 1) => db.prepare('INSERT INTO audit(actor,action,details,createdAt,workspaceId) VALUES(?,?,?,?,?)').run(user?.email || 'system', action, JSON.stringify(details), new Date().toISOString(), workspaceId);
   const mailTransport = process.env.SMTP_HOST ? nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: Number(process.env.SMTP_PORT || 587) === 465, auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD } : undefined }) : null;
   const openAiKey = process.env.OPENAI_API_KEY;
   const openAiModel = process.env.OPENAI_MODEL || 'gpt-4o-mini';
   const openAiBaseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
   const sendMail = async (to, subject, textBody) => {
-    if (!mailTransport || !process.env.MAIL_FROM) { console.log(`Mail (${subject}) for ${to}: ${textBody}`); return; }
+    if (!mailTransport || !process.env.MAIL_FROM) { if (process.env.NODE_ENV !== 'test') console.log(`Mail (${subject}) for ${to}: ${textBody}`); return; }
     await mailTransport.sendMail({ from: process.env.MAIL_FROM, to, subject, text: textBody });
   };
-  const load = () => {
-    const row = db.prepare('SELECT revision,payload FROM workspace WHERE id=1').get();
+  const workspaceRow = workspaceId => {
+    const row = db.prepare('SELECT id,name,term,revision,payload,createdAt,updatedAt FROM workspaces WHERE id=?').get(workspaceId);
+    if (!row) throw httpError(404, 'Workspace not found.');
+    return row;
+  };
+  const load = workspaceId => {
+    const row = workspaceRow(workspaceId);
     return { revision: row.revision, workspace: JSON.parse(row.payload) };
   };
-  function save(workspace, revision, user) {
+  const workspaceSummary = row => ({ id: row.id, name: row.name, ...(row.term ? { term: JSON.parse(row.term) } : {}) });
+  const linkFor = (user, workspaceId) => db.prepare('SELECT facultyId,groupId FROM user_workspace_links WHERE userId=? AND workspaceId=?').get(user.id, workspaceId) || { facultyId: null, groupId: null };
+  const publicFor = (user, workspaceId) => publicUser(user, linkFor(user, workspaceId));
+  function workspaceIdFrom(url) {
+    const raw = url.searchParams.get('workspaceId');
+    if (raw === null) return 1;
+    if (!/^\d+$/.test(raw) || Number(raw) < 1 || !Number.isSafeInteger(Number(raw))) throw httpError(400, 'workspaceId must be a positive integer.');
+    const id = Number(raw);
+    workspaceRow(id);
+    return id;
+  };
+  function save(workspaceId, workspace, revision, user) {
     if (!Number.isInteger(revision)) throw httpError(400, 'Workspace revision is required.');
     let parsed;
     try { parsed = parseWorkspace(JSON.stringify(workspace)); }
     catch (error) { throw httpError(400, error.message); }
     const payload = JSON.stringify(parsed);
+    const now = new Date().toISOString();
     db.exec('BEGIN IMMEDIATE');
     try {
-      const result = db.prepare('UPDATE workspace SET payload=?,revision=revision+1 WHERE id=1 AND revision=?').run(payload, revision);
+      const result = db.prepare('UPDATE workspaces SET payload=?,term=?,revision=revision+1,updatedAt=? WHERE id=? AND revision=?').run(payload, parsed.term ? JSON.stringify(parsed.term) : null, now, workspaceId, revision);
       if (!result.changes) throw httpError(409, 'Another planner changed this workspace. Download your draft, then reload the latest version.');
-      db.prepare('INSERT INTO history VALUES(?,?,?,?)').run(revision + 1, payload, user.name, new Date().toISOString());
-      db.prepare('DELETE FROM history WHERE revision <= ?').run(revision - 49);
+      db.prepare('INSERT INTO workspace_history(workspaceId,revision,payload,actor,savedAt) VALUES(?,?,?,?,?)').run(workspaceId, revision + 1, payload, user.name, now);
+      db.prepare('DELETE FROM workspace_history WHERE workspaceId=? AND revision <= ?').run(workspaceId, revision - 49);
+      if (workspaceId === 1) {
+        db.prepare('UPDATE workspace SET payload=?,revision=? WHERE id=1').run(payload, revision + 1);
+        db.prepare('INSERT OR IGNORE INTO history(revision,payload,actor,savedAt) VALUES(?,?,?,?)').run(revision + 1, payload, user.name, now);
+        db.prepare('DELETE FROM history WHERE revision <= ?').run(revision - 49);
+      }
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
-    audit(user, 'workspace.saved', { revision: revision + 1 });
+    audit(user, 'workspace.saved', { revision: revision + 1 }, workspaceId);
     return { workspace: parsed, revision: revision + 1 };
   }
-  async function createAiSchedule(workspace, user) {
-    if (!openAiKey) throw httpError(503, 'AI planning is not configured. Add OPENAI_API_KEY to the server environment.');
+  async function createAiSchedule(workspace, user, workspaceId) {
+    if (!openAiKey) throw httpError(503, 'AI planning is not configured. Configure the AI provider on the server.');
     let parsed;
     try { parsed = parseWorkspace(JSON.stringify(workspace)); }
     catch (error) { throw httpError(400, error.message); }
     const { data, schedule } = parsed;
     const lockedSessions = schedule?.sessions.filter(session => session.locked) || [];
     const prompt = {
-      data,
+      data: {
+        courses: data.courses,
+        faculty: data.faculty.map(member => ({ id: member.id, maxDailyPeriods: member.maxDailyPeriods, unavailable: member.unavailable })),
+        rooms: data.rooms,
+        groups: data.groups,
+        preferences: data.preferences,
+      },
       lockedSessions,
       instructions: [
-        'Create a complete weekly timetable for every requested course session.',
-        'Return only JSON with a sessions array. Do not include markdown or explanations.',
-        'Each session must contain id, courseId, day, period, roomId, and optional locked boolean.',
-        'Use only IDs from the supplied data. Days and periods are zero-based.',
-        'Each course can meet at most once per day. Multi-period courses must use contiguous periods and cannot cross breaks.',
-        'Preserve every locked session exactly, including its id, day, period, roomId, and locked=true.',
+        'Rank the courses in the order they should be planned, placing the most constrained courses first.',
+        'Return only JSON with a courseOrder array. Do not include markdown, explanations, sessions, or time placements.',
+        'courseOrder must contain every course ID exactly once and must use only IDs from the supplied data.',
+        'Consider weekly sessions, duration, room type and features, group size, faculty availability, daily limits, teaching days, and locked sessions.',
       ],
     };
     let response;
@@ -139,6 +216,7 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
         body: JSON.stringify({
           model: openAiModel,
           temperature: 0.15,
+          max_tokens: 1000,
           response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: 'You are the ISchedule timetable planning engine. Produce valid structured timetable data and follow the supplied constraints exactly.' },
@@ -156,8 +234,8 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
         const errorBody = await response.json();
         detail = typeof errorBody?.error?.message === 'string' ? errorBody.error.message : '';
       } catch { /* The provider may return a non-JSON error response. */ }
-      if (response.status === 429) throw httpError(429, detail ? `OpenAI rate limit or billing quota reached: ${detail}` : 'OpenAI rate limit or billing quota reached. Check API billing, usage limits, and rate limits.');
-      throw httpError(502, detail ? `The AI service rejected the timetable request: ${detail}` : `The AI service rejected the timetable request (${response.status}).`);
+      if (response.status === 429) throw httpError(429, detail ? `The AI provider rate limit or quota was reached: ${detail}` : 'The AI provider rate limit or quota was reached. Check usage limits and rate limits.');
+      throw httpError(502, detail ? `The AI provider rejected the timetable request: ${detail}` : `The AI provider rejected the timetable request (${response.status}).`);
     }
     let body;
     try { body = await response.json(); }
@@ -167,24 +245,13 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     let result;
     try { result = JSON.parse(content); }
     catch { throw httpError(502, 'The AI service returned invalid timetable JSON.'); }
-    if (!Array.isArray(result?.sessions) || result.sessions.length > 2500) throw httpError(502, 'The AI service returned an invalid session list.');
-    const sessions = result.sessions.map(session => ({
-      id: session?.id,
-      courseId: session?.courseId,
-      day: session?.day,
-      period: session?.period,
-      roomId: session?.roomId,
-      ...(session?.locked === true ? { locked: true } : {}),
-    }));
-    if (sessions.some(session => !text(session.id) || !text(session.courseId) || !text(session.roomId) || !Number.isInteger(session.day) || !Number.isInteger(session.period) || (session.locked !== undefined && session.locked !== true))) throw httpError(502, 'The AI service returned malformed timetable sessions.');
-    const issues = validateSchedule(data, sessions);
-    if (issues.length) throw httpError(502, `The AI proposed an invalid timetable: ${issues[0].message}`);
-    for (const locked of lockedSessions) {
-      const candidate = sessions.find(session => session.id === locked.id);
-      if (!candidate || candidate.courseId !== locked.courseId || candidate.day !== locked.day || candidate.period !== locked.period || candidate.roomId !== locked.roomId || candidate.locked !== true) throw httpError(502, 'The AI changed a locked session. Try again or use the deterministic planner.');
-    }
-    const planned = summarizeSchedule(data, sessions);
-    audit(user, 'workspace.ai_plan_generated', { model: openAiModel, placed: sessions.length, unscheduled: planned.unscheduled.reduce((total, item) => total + item.count, 0) });
+    if (!Array.isArray(result?.courseOrder) || result.courseOrder.length !== data.courses.length || result.courseOrder.some(courseId => typeof courseId !== 'string')) throw httpError(502, 'The AI service returned an invalid course priority list.');
+    const knownCourseIds = new Set(data.courses.map(course => course.id));
+    if (new Set(result.courseOrder).size !== result.courseOrder.length || result.courseOrder.some(courseId => !knownCourseIds.has(courseId))) throw httpError(502, 'The AI service returned unknown or duplicate course IDs.');
+    const courseById = new Map(data.courses.map(course => [course.id, course]));
+    const aiData = { ...data, courses: result.courseOrder.map(courseId => courseById.get(courseId)) };
+    const planned = generateSchedule(aiData, undefined, Date.now(), 20, lockedSessions);
+    audit(user, 'workspace.ai_plan_generated', { model: openAiModel, placed: planned.sessions.length, unscheduled: planned.unscheduled.reduce((total, item) => total + item.count, 0) }, workspaceId);
     return planned;
   }
   function token(request) {
@@ -210,6 +277,48 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end(JSON.stringify(value));
   };
+  function publishedFor(user, workspaceId, workspace) {
+    if (user.role === 'admin' || user.role === 'planner') return workspace;
+    const link = linkFor(user, workspaceId);
+    if (user.role === 'faculty' && !link.facultyId) return null;
+    if (user.role === 'student' && !link.groupId) return null;
+    if (!['faculty', 'student'].includes(user.role)) return null;
+    const courseMatches = user.role === 'faculty'
+      ? workspace.data.courses.filter(course => course.facultyId === link.facultyId)
+      : workspace.data.courses.filter(course => course.groupId === link.groupId);
+    const courseIds = new Set(courseMatches.map(course => course.id));
+    const roomIds = new Set((workspace.schedule?.sessions || []).filter(session => courseIds.has(session.courseId)).map(session => session.roomId));
+    const groupIds = new Set(courseMatches.map(course => course.groupId));
+    const facultyIds = new Set(courseMatches.map(course => course.facultyId));
+    return {
+      ...workspace,
+      data: {
+        ...workspace.data,
+        courses: courseMatches,
+        faculty: workspace.data.faculty.filter(member => facultyIds.has(member.id)),
+        groups: workspace.data.groups.filter(group => groupIds.has(group.id)),
+        rooms: workspace.data.rooms.filter(room => roomIds.has(room.id)),
+      },
+      schedule: workspace.schedule ? {
+        ...workspace.schedule,
+        sessions: workspace.schedule.sessions.filter(session => courseIds.has(session.courseId)),
+        unscheduled: workspace.schedule.unscheduled.filter(item => courseIds.has(item.courseId)),
+      } : null,
+    };
+  }
+  function availabilitySlots(value, field) {
+    if (!Array.isArray(value) || value.length > 35 || value.some(slot => typeof slot !== 'string' || !slotPattern.test(slot)) || new Set(value).size !== value.length) throw httpError(400, `${field} must contain unique weekly slots such as 2-4.`);
+    return value;
+  }
+  function scheduleConflicts(data, schedule, facultyId, unavailable) {
+    return (schedule?.sessions || []).filter(session => {
+      const course = data.courses.find(item => item.id === session.courseId);
+      return course?.facultyId === facultyId && unavailable.some(slot => {
+        const [day, period] = slot.split('-').map(Number);
+        return day === session.day && period >= session.period && period < session.period + course.duration;
+      });
+    });
+  }
   async function route(request, response) {
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('X-Frame-Options', 'DENY');
@@ -258,6 +367,7 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     }
     if (path === '/api/health' && request.method === 'GET') return send(response, 200, { ok: true });
     if (['/api/auth/login', '/api/auth/register'].includes(path) && request.method === 'POST') {
+      const workspaceId = workspaceIdFrom(url);
       const key = request.socket.remoteAddress;
       const attempt = loginAttempts.get(key);
       const current = attempt && attempt.until > Date.now() ? attempt : { count: 0, until: Date.now() + 60_000 };
@@ -272,21 +382,23 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
         if (user) throw httpError(409, 'This email is already registered.');
         const encoded = await encodePassword(value.password);
         // Choose the bootstrap role AFTER hashing so simultaneous signups cannot create two bootstrap admins.
-        const invitation = text(value.invite, 100) ? db.prepare('SELECT * FROM invitations WHERE token=? AND expires>? AND usedBy IS NULL').get(hash(value.invite), Date.now()) : null;
+        const invitation = text(value.invite, 100) ? db.prepare('SELECT * FROM invitations WHERE token=? AND workspaceId=? AND expires>? AND usedBy IS NULL').get(hash(value.invite), workspaceId, Date.now()) : null;
         if (value.invite && (!invitation || invitation.email !== email)) throw httpError(400, 'This invitation is invalid, expired, or addressed to another email.');
-        const role = invitation?.role || (db.prepare('SELECT count(*) AS n FROM users').get().n === 0 ? 'admin' : value.role === 'viewer' ? 'viewer' : 'planner');
-        user = { id: randomBytes(16).toString('hex'), name: value.name.trim(), email, role, passwordHash: encoded, facultyId: invitation?.facultyId || null, groupId: invitation?.groupId || null, emailVerified: 0 };
-        try { db.prepare('INSERT INTO users(id,name,email,role,passwordHash,facultyId,groupId,emailVerified) VALUES(?,?,?,?,?,?,?,0)').run(user.id, user.name, email, role, encoded, user.facultyId, user.groupId); }
+        // After bootstrap, self-selected roles are never trusted. Invitations are the only way to obtain a non-viewer role.
+        const role = invitation?.role || (db.prepare('SELECT count(*) AS n FROM users').get().n === 0 ? 'admin' : 'viewer');
+        user = { id: randomBytes(16).toString('hex'), name: value.name.trim(), email, role, passwordHash: encoded, facultyId: null, groupId: null, emailVerified: 0 };
+        try { db.prepare('INSERT INTO users(id,name,email,role,passwordHash,facultyId,groupId,emailVerified) VALUES(?,?,?,?,?,?,?,0)').run(user.id, user.name, email, role, encoded, null, null); }
         catch { throw httpError(409, 'This email is already registered.'); }
+        db.prepare('INSERT INTO user_workspace_links(userId,workspaceId,facultyId,groupId) VALUES(?,?,?,?)').run(user.id, workspaceId, invitation?.facultyId || null, invitation?.groupId || null);
         if (invitation) db.prepare('UPDATE invitations SET usedBy=? WHERE token=?').run(user.id, hash(value.invite));
         const verificationToken = randomBytes(32).toString('hex');
         db.prepare('INSERT INTO email_tokens VALUES(?,?,?)').run(hash(verificationToken), user.id, Date.now() + 24 * 60 * 60 * 1000);
         await sendMail(email, 'Verify your ISchedule account', `${publicOrigin || 'http://localhost:4174'}/verify-email?token=${verificationToken}`);
         user.emailVerified = 0;
-      } else if (!user || !(await checkPassword(value.password, user.passwordHash))) throw httpError(401, 'Email or password is incorrect.');
+      } else if (!user || !user.active || !(await checkPassword(value.password, user.passwordHash))) throw httpError(401, 'Email or password is incorrect.');
       setSession(response, user, request);
-      audit(user, path.endsWith('/register') ? 'account.registered' : 'account.login');
-      return send(response, path.endsWith('/register') ? 201 : 200, { user: publicUser(user) });
+      audit(user, path.endsWith('/register') ? 'account.registered' : 'account.login', {}, workspaceId);
+      return send(response, path.endsWith('/register') ? 201 : 200, { user: publicFor(user, workspaceId) });
     }
     if (path === '/api/auth/forgot-password' && request.method === 'POST') {
       const value = await readBody(request);
@@ -304,7 +416,7 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       if (!passwordValid(value.password) || !text(value.token, 100)) throw httpError(400, 'A valid reset token and new password are required.');
       const row = db.prepare('SELECT * FROM reset_tokens WHERE token=? AND expires>?').get(hash(value.token), Date.now());
       if (!row) throw httpError(400, 'This password reset link is invalid or expired.');
-      db.prepare('UPDATE users SET passwordHash=?,active=1 WHERE id=?').run(await encodePassword(value.password), row.userId);
+      db.prepare('UPDATE users SET passwordHash=? WHERE id=?').run(await encodePassword(value.password), row.userId);
       db.prepare('DELETE FROM reset_tokens WHERE userId=?').run(row.userId);
       db.prepare('DELETE FROM sessions WHERE userId=?').run(row.userId);
       audit({ email: row.userId }, 'account.password_reset');
@@ -325,7 +437,8 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       return send(response, 200, { ok: true });
     }
     const user = authenticate(request);
-    if (path === '/api/auth/me' && request.method === 'GET') return send(response, 200, { user: publicUser(user) });
+    const workspaceId = workspaceIdFrom(url);
+    if (path === '/api/auth/me' && request.method === 'GET') return send(response, 200, { user: publicFor(user, workspaceId) });
     if (path === '/api/auth/password' && request.method === 'POST') {
       const value = await readBody(request);
       if (!passwordValid(value.password) || typeof value.currentPassword !== 'string' || value.currentPassword.length > 200 || !(await checkPassword(value.currentPassword, user.passwordHash))) throw httpError(400, 'Check your current password and use an 8–200 character new password.');
@@ -333,34 +446,80 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       db.prepare('UPDATE users SET passwordHash=? WHERE id=?').run(encoded, user.id);
       db.prepare('DELETE FROM sessions WHERE userId=?').run(user.id);
       setSession(response, user, request);
-      audit(user, 'account.password_changed');
+      audit(user, 'account.password_changed', {}, workspaceId);
       return send(response, 200, { ok: true });
     }
-    if (path === '/api/workspace' && request.method === 'GET') return send(response, 200, load());
+    if (path === '/api/workspaces' && request.method === 'GET') {
+      return send(response, 200, { workspaces: db.prepare('SELECT id,name,term FROM workspaces ORDER BY id').all().map(workspaceSummary) });
+    }
+    if (path === '/api/workspaces' && request.method === 'POST') {
+      requireRole(user, ['admin', 'planner']);
+      const value = await readBody(request);
+      if (!text(value.name, 120)) throw httpError(400, 'Workspace name is required.');
+      const sourceId = value.sourceWorkspaceId === undefined || value.sourceWorkspaceId === null ? null : Number(value.sourceWorkspaceId);
+      if (sourceId !== null && (!Number.isSafeInteger(sourceId) || sourceId < 1)) throw httpError(400, 'sourceWorkspaceId must be a positive integer.');
+      const source = sourceId === null ? null : load(sourceId).workspace;
+      let workspace = source ? { ...source, data: source.data, schedule: value.copySchedule === true ? source.schedule : null } : { version: 1, data: createDemoData(), schedule: null };
+      if (value.term !== undefined) workspace = { ...workspace, term: value.term };
+      let parsed;
+      try { parsed = parseWorkspace(JSON.stringify(workspace)); } catch (error) { throw httpError(400, error.message); }
+      const now = new Date().toISOString();
+      const result = db.prepare('INSERT INTO workspaces(name,term,revision,payload,createdAt,updatedAt) VALUES(?,?,0,?,?,?)').run(value.name.trim(), parsed.term ? JSON.stringify(parsed.term) : null, JSON.stringify(parsed), now, now);
+      const id = Number(result.lastInsertRowid);
+      audit(user, 'workspace.created', { id, sourceWorkspaceId: sourceId, copySchedule: value.copySchedule === true }, id);
+      return send(response, 201, { id });
+    }
+    if (path === '/api/workspace' && request.method === 'GET') {
+      requireRole(user, ['admin', 'planner']);
+      return send(response, 200, load(workspaceId));
+    }
     if (path === '/api/workspace' && request.method === 'PUT') {
       requireRole(user, ['admin', 'planner']);
       const value = await readBody(request);
-      return send(response, 200, save(value.workspace, value.revision, user));
+      return send(response, 200, save(workspaceId, value.workspace, value.revision, user));
     }
     if (path === '/api/ai/plan' && request.method === 'POST') {
       requireRole(user, ['admin', 'planner']);
       const value = await readBody(request);
-      return send(response, 200, { schedule: await createAiSchedule(value.workspace, user) });
+      return send(response, 200, { schedule: await createAiSchedule(value.workspace, user, workspaceId) });
+    }
+    if (path === '/api/availability' && request.method === 'GET') {
+      requireRole(user, ['faculty']);
+      const link = linkFor(user, workspaceId);
+      if (!link.facultyId) throw httpError(400, 'Ask your administrator to link your faculty record in this workspace.');
+      const current = load(workspaceId);
+      const faculty = current.workspace.data.faculty.find(item => item.id === link.facultyId);
+      if (!faculty) throw httpError(400, 'Linked faculty record no longer exists in this workspace.');
+      return send(response, 200, { faculty, revision: current.revision });
     }
     if (path === '/api/availability' && request.method === 'PUT') {
       requireRole(user, ['faculty']);
-      if (!user.facultyId) throw httpError(400, 'Ask your administrator to link your faculty record.');
+      const link = linkFor(user, workspaceId);
+      if (!link.facultyId) throw httpError(400, 'Ask your administrator to link your faculty record in this workspace.');
       const value = await readBody(request);
-      const current = load();
-      const faculty = current.workspace.data.faculty.find(item => item.id === user.facultyId);
-      if (!faculty) throw httpError(400, 'Linked faculty record no longer exists.');
-      faculty.unavailable = value.unavailable;
-      // Availability changes must remain compatible with the current timetable.
-      return send(response, 200, save(current.workspace, value.revision, user));
+      const unavailable = availabilitySlots(value.unavailable, 'unavailable');
+      const preferred = availabilitySlots(value.preferred === undefined ? [] : value.preferred, 'preferred');
+      if (preferred.some(slot => unavailable.includes(slot))) throw httpError(400, 'Preferred and unavailable slots must be disjoint.');
+      const current = load(workspaceId);
+      if (!Number.isInteger(value.revision)) throw httpError(400, 'Availability revision is required.');
+      if (value.revision !== current.revision) throw httpError(409, 'Availability is out of date. Reload the current faculty record before saving.');
+      const faculty = current.workspace.data.faculty.find(item => item.id === link.facultyId);
+      if (!faculty) throw httpError(400, 'Linked faculty record no longer exists in this workspace.');
+      const draftConflicts = scheduleConflicts(current.workspace.data, current.workspace.schedule, link.facultyId, unavailable);
+      const publishedRow = db.prepare('SELECT payload FROM workspace_versions WHERE workspaceId=? AND published=1 ORDER BY id DESC LIMIT 1').get(workspaceId);
+      const published = publishedRow ? JSON.parse(publishedRow.payload) : null;
+      const publishedConflicts = published ? scheduleConflicts(published.data, published.schedule, link.facultyId, unavailable) : [];
+      if (draftConflicts.length || publishedConflicts.length) throw httpError(400, `Availability conflicts with ${draftConflicts.length ? 'the draft timetable' : 'the published timetable'}; adjust the timetable before saving.`);
+      const next = JSON.parse(JSON.stringify(current.workspace));
+      const nextFaculty = next.data.faculty.find(item => item.id === link.facultyId);
+      nextFaculty.unavailable = unavailable;
+      nextFaculty.preferred = preferred;
+      const saved = save(workspaceId, next, value.revision, user);
+      return send(response, 200, { faculty: saved.workspace.data.faculty.find(item => item.id === link.facultyId), revision: saved.revision });
     }
     if (path === '/api/users' && request.method === 'GET') {
       requireRole(user, ['admin']);
-      return send(response, 200, { users: db.prepare('SELECT * FROM users ORDER BY name').all().map(publicUser) });
+      return send(response, 200, { users: db.prepare('SELECT * FROM users ORDER BY name').all().map(target => publicFor(target, workspaceId)) });
     }
     if (path.startsWith('/api/users/') && request.method === 'PUT') {
       requireRole(user, ['admin']);
@@ -371,14 +530,20 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       if (!roles.includes(value.role)) throw httpError(400, 'Invalid role.');
       if (id === user.id && value.role !== 'admin') throw httpError(400, 'You cannot remove your own administrator role.');
       if (id === user.id && value.active === false) throw httpError(400, 'You cannot deactivate your own account.');
-      const { workspace } = load();
+      const { workspace } = load(workspaceId);
       const facultyId = value.role === 'faculty' ? value.facultyId || null : null;
       const groupId = value.role === 'student' ? value.groupId || null : null;
       if (facultyId && !workspace.data.faculty.some(item => item.id === facultyId)) throw httpError(400, 'Choose an existing faculty member.');
       if (groupId && !workspace.data.groups.some(item => item.id === groupId)) throw httpError(400, 'Choose an existing student group.');
-      db.prepare('UPDATE users SET role=?,facultyId=?,groupId=?,active=? WHERE id=?').run(value.role, facultyId, groupId, value.active === false ? 0 : 1, id);
-      audit(user, 'account.updated', { target: id, role: value.role, active: value.active !== false });
-      return send(response, 200, { user: publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(id)) });
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare('UPDATE users SET role=?,active=? WHERE id=?').run(value.role, value.active === false ? 0 : 1, id);
+        db.prepare('INSERT INTO user_workspace_links(userId,workspaceId,facultyId,groupId) VALUES(?,?,?,?) ON CONFLICT(userId,workspaceId) DO UPDATE SET facultyId=excluded.facultyId,groupId=excluded.groupId').run(id, workspaceId, facultyId, groupId);
+        if (workspaceId === 1) db.prepare('UPDATE users SET facultyId=?,groupId=? WHERE id=?').run(facultyId, groupId, id);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+      audit(user, 'account.updated', { target: id, role: value.role, active: value.active !== false }, workspaceId);
+      return send(response, 200, { user: publicFor(db.prepare('SELECT * FROM users WHERE id=?').get(id), workspaceId) });
     }
     if (path.startsWith('/api/users/') && request.method === 'POST' && path.endsWith('/reset-password')) {
       requireRole(user, ['admin']);
@@ -388,7 +553,7 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       if (!passwordValid(value.password)) throw httpError(400, 'Use an 8–200 character temporary password.');
       db.prepare('UPDATE users SET passwordHash=? WHERE id=?').run(await encodePassword(value.password), id);
       db.prepare('DELETE FROM sessions WHERE userId=?').run(id);
-      audit(user, 'account.password_reset_by_admin', { target: id });
+      audit(user, 'account.password_reset_by_admin', { target: id }, workspaceId);
       return send(response, 200, { ok: true });
     }
     if (path === '/api/invitations' && request.method === 'POST') {
@@ -396,53 +561,59 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
       const value = await readBody(request);
       if (!emailValid(value.email) || !roles.includes(value.role) || value.role === 'admin') throw httpError(400, 'Choose a valid email and non-administrator role.');
       const invite = randomBytes(32).toString('hex');
-      db.prepare('INSERT INTO invitations VALUES(?,?,?,?,?,?,NULL)').run(hash(invite), value.email.trim().toLowerCase(), value.role, value.facultyId || null, value.groupId || null, Date.now() + 7 * 24 * 60 * 60 * 1000);
+      const { workspace } = load(workspaceId);
+      const facultyId = value.role === 'faculty' ? value.facultyId || null : null;
+      const groupId = value.role === 'student' ? value.groupId || null : null;
+      if (facultyId && !workspace.data.faculty.some(item => item.id === facultyId)) throw httpError(400, 'Choose an existing faculty member.');
+      if (groupId && !workspace.data.groups.some(item => item.id === groupId)) throw httpError(400, 'Choose an existing student group.');
+      db.prepare('INSERT INTO invitations(token,email,role,facultyId,groupId,expires,usedBy,workspaceId) VALUES(?,?,?,?,?,?,NULL,?)').run(hash(invite), value.email.trim().toLowerCase(), value.role, facultyId, groupId, Date.now() + 7 * 24 * 60 * 60 * 1000, workspaceId);
       const link = `/register?invite=${invite}`;
       await sendMail(value.email, 'You are invited to ISchedule', `${publicOrigin || 'http://localhost:4174'}${link}`);
-      audit(user, 'account.invitation_created', { email: value.email, role: value.role });
+      audit(user, 'account.invitation_created', { email: value.email, role: value.role }, workspaceId);
       return send(response, 201, { link, ...(process.env.NODE_ENV !== 'production' ? { token: invite } : {}) });
     }
     if (path === '/api/audit' && request.method === 'GET') {
       requireRole(user, ['admin']);
-      return send(response, 200, { audit: db.prepare('SELECT actor,action,details,createdAt FROM audit ORDER BY id DESC LIMIT 200').all() });
+      return send(response, 200, { audit: db.prepare('SELECT actor,action,details,createdAt FROM audit WHERE workspaceId=? ORDER BY id DESC LIMIT 200').all(workspaceId) });
     }
     if (path === '/api/versions' && request.method === 'GET') {
       requireRole(user, ['admin', 'planner']);
-      return send(response, 200, { versions: db.prepare('SELECT id,name,revision,published,createdBy,createdAt FROM workspace_versions ORDER BY id DESC LIMIT 100').all() });
+      return send(response, 200, { versions: db.prepare('SELECT id,name,revision,published,createdBy,createdAt FROM workspace_versions WHERE workspaceId=? ORDER BY id DESC LIMIT 100').all(workspaceId) });
     }
     if (path === '/api/versions' && request.method === 'POST') {
       requireRole(user, ['admin', 'planner']);
       const value = await readBody(request);
       if (!text(value.name, 120)) throw httpError(400, 'Version name is required.');
-      const current = load();
-      const result = db.prepare('INSERT INTO workspace_versions(name,revision,payload,published,createdBy,createdAt) VALUES(?,?,?,?,?,?)').run(value.name.trim(), current.revision, JSON.stringify(current.workspace), 0, user.email, new Date().toISOString());
-      audit(user, 'workspace.version_created', { id: result.lastInsertRowid, name: value.name });
+      const current = load(workspaceId);
+      const result = db.prepare('INSERT INTO workspace_versions(workspaceId,name,revision,payload,published,createdBy,createdAt) VALUES(?,?,?,?,?,?,?)').run(workspaceId, value.name.trim(), current.revision, JSON.stringify(current.workspace), 0, user.email, new Date().toISOString());
+      audit(user, 'workspace.version_created', { id: result.lastInsertRowid, name: value.name }, workspaceId);
       return send(response, 201, { id: result.lastInsertRowid });
     }
     if (path.startsWith('/api/versions/') && path.endsWith('/publish') && request.method === 'POST') {
       requireRole(user, ['admin', 'planner']);
       const versionId = Number(path.split('/')[3]);
-      if (!db.prepare('SELECT id FROM workspace_versions WHERE id=?').get(versionId)) throw httpError(404, 'Version not found.');
+      if (!Number.isSafeInteger(versionId) || !db.prepare('SELECT id FROM workspace_versions WHERE id=? AND workspaceId=?').get(versionId, workspaceId)) throw httpError(404, 'Version not found in this workspace.');
       db.exec('BEGIN IMMEDIATE');
-      try { db.prepare('UPDATE workspace_versions SET published=0').run(); db.prepare('UPDATE workspace_versions SET published=1 WHERE id=?').run(versionId); db.exec('COMMIT'); }
+      try { db.prepare('UPDATE workspace_versions SET published=0 WHERE workspaceId=?').run(workspaceId); db.prepare('UPDATE workspace_versions SET published=1 WHERE id=? AND workspaceId=?').run(versionId, workspaceId); db.exec('COMMIT'); }
       catch (error) { db.exec('ROLLBACK'); throw error; }
-      audit(user, 'workspace.version_published', { id: versionId });
+      audit(user, 'workspace.version_published', { id: versionId }, workspaceId);
       return send(response, 200, { ok: true });
     }
     if (path === '/api/published' && request.method === 'GET') {
-      const version = db.prepare('SELECT id,name,revision,payload,createdAt FROM workspace_versions WHERE published=1 ORDER BY id DESC LIMIT 1').get();
-      return send(response, 200, { version: version ? { ...version, payload: JSON.parse(version.payload) } : null });
+      const version = db.prepare('SELECT id,name,revision,payload,createdAt FROM workspace_versions WHERE workspaceId=? AND published=1 ORDER BY id DESC LIMIT 1').get(workspaceId);
+      const payload = version ? publishedFor(user, workspaceId, JSON.parse(version.payload)) : null;
+      return send(response, 200, { version: version && payload ? { ...version, payload } : null });
     }
     if (path === '/api/history' && request.method === 'GET') {
       requireRole(user, ['admin', 'planner']);
-      return send(response, 200, { history: db.prepare('SELECT revision,actor,savedAt FROM history ORDER BY revision DESC LIMIT 50').all() });
+      return send(response, 200, { history: db.prepare('SELECT revision,actor,savedAt FROM workspace_history WHERE workspaceId=? ORDER BY revision DESC LIMIT 50').all(workspaceId) });
     }
     if (path === '/api/history/restore' && request.method === 'POST') {
       requireRole(user, ['admin']);
       const value = await readBody(request);
-      const entry = db.prepare('SELECT payload FROM history WHERE revision=?').get(value.targetRevision ?? -1);
+      const entry = db.prepare('SELECT payload FROM workspace_history WHERE workspaceId=? AND revision=?').get(workspaceId, value.targetRevision ?? -1);
       if (!entry) throw httpError(404, 'Saved version not found.');
-      return send(response, 200, save(JSON.parse(entry.payload), value.revision, user));
+      return send(response, 200, save(workspaceId, JSON.parse(entry.payload), value.revision, user));
     }
     throw httpError(404, 'API route not found.');
   }

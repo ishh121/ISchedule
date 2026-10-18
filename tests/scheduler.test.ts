@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createDemoData } from '../src/seed';
-import { contiguous, exportCsv, exportIcs, generateSchedule, placementIssues, validateSchedule } from '../src/scheduler';
+import { contiguous, exportCsv, exportIcs, facultyDailyLoads, facultyLoadPenalty, generateSchedule, placementIssues, scorePlacement, validateSchedule } from '../src/scheduler';
 import type { Session } from '../src/types';
 
 describe('timetable scheduler', () => {
@@ -54,5 +54,46 @@ describe('timetable scheduler', () => {
     expect(ics).toContain('SUMMARY:CS201 · Data Structures');
     expect(ics).toContain('LOCATION:Room 101');
     expect(ics).toContain('END:VCALENDAR');
+  });
+
+  it('scores first-period avoidance without turning it into a hard constraint', () => {
+    const data = createDemoData();
+    data.preferences = { ...data.preferences, avoidFirstPeriod: true };
+    const later = { id: 'later', courseId: 'c1', day: 1, period: 1, roomId: 'r1' };
+    const first = { ...later, id: 'first', period: 0 };
+
+    expect(scorePlacement(data, [], first)).toBeGreaterThan(scorePlacement(data, [], later));
+    expect(placementIssues(data, [], first)).toEqual([]);
+  });
+
+  it('balances faculty daily workload when the preference is enabled', () => {
+    const data = createDemoData();
+    data.preferences = { ...data.preferences, balanceFacultyLoad: true };
+    const concentrated: Session[] = [
+      { id: 'one', courseId: 'c1', day: 0, period: 0, roomId: 'r1' },
+      { id: 'two', courseId: 'c1', day: 0, period: 1, roomId: 'r1' },
+    ];
+    const distributed: Session[] = [
+      { id: 'one', courseId: 'c1', day: 0, period: 0, roomId: 'r1' },
+      { id: 'two', courseId: 'c1', day: 1, period: 0, roomId: 'r1' },
+    ];
+
+    expect(facultyDailyLoads(data, concentrated, 'f1')).toEqual([2, 0, 0, 0, 0]);
+    expect(facultyLoadPenalty(data, distributed, 'f1')).toBeLessThan(facultyLoadPenalty(data, concentrated, 'f1'));
+    const candidate = { id: 'candidate', courseId: 'c1', day: 2, period: 0, roomId: 'r1' };
+    expect(scorePlacement(data, distributed, candidate)).toBeLessThan(scorePlacement(data, concentrated, candidate));
+  });
+
+  it('counts real gaps when avoidGaps is enabled', () => {
+    const data = createDemoData();
+    const sessions: Session[] = [
+      { id: 'morning', courseId: 'c1', day: 1, period: 0, roomId: 'r1' },
+      { id: 'late', courseId: 'c2', day: 1, period: 2, roomId: 'r2' },
+    ];
+    const compact = { ...data, preferences: { ...data.preferences, avoidGaps: true } };
+    const withoutGapPreference = { ...data, preferences: { ...data.preferences, avoidGaps: false } };
+    const candidate = { id: 'candidate', courseId: 'c3', day: 1, period: 4, roomId: 'r1' };
+
+    expect(scorePlacement(compact, sessions, candidate)).toBeGreaterThan(scorePlacement(withoutGapPreference, sessions, candidate));
   });
 });

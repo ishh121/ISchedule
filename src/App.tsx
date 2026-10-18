@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'r
 import {
   ArrowRight,
   BookOpen,
+  ClipboardList,
   CalendarDays,
   Check,
   ChevronRight,
@@ -9,6 +10,7 @@ import {
   Clock3,
   Download,
   DoorOpen,
+  FileText,
   FileJson,
   GraduationCap,
   LayoutDashboard,
@@ -27,17 +29,22 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import ResourceEditor, { singular, type ResourceKind } from './components/ResourceEditor';
 import SessionEditor from './components/SessionEditor';
-import { clearAuthToken, createInvitation, createVersion, currentUser, generateAiSchedule, getPublishedWorkspace, getRemoteWorkspace, hasAuthToken, listUsers, listVersions, login, logout, publishVersion, register, requestPasswordReset, resetPassword, resetUserPassword, saveRemoteWorkspace, updateUserRole, verifyEmail, type AuthUser, type UserRole } from './api';
+import { clearAuthToken, createInvitation, createVersion, createWorkspace, currentUser, generateAiSchedule, getActiveWorkspaceId, getAvailability, getPublishedWorkspace, getRemoteWorkspace, hasAuthToken, listAudit, listUsers, listVersions, listWorkspaces, login, logout, publishVersion, register, requestPasswordReset, resetPassword, resetUserPassword, saveAvailability, saveRemoteWorkspace, setActiveWorkspaceId, updateUserRole, verifyEmail, type AuthUser, type UserRole } from './api';
 import { createDemoData } from './seed';
 import { exportCsv, exportIcs, summarizeSchedule } from './scheduler';
+import PlanningBoard from './components/PlanningBoard';
+import BulkImport from './components/BulkImport';
+import PlanningReports from './components/PlanningReports';
 import {
   DAYS,
   PERIODS,
   type CollegeData,
+  type AcademicTerm,
   type Page,
   type SavedWorkspace,
   type ScheduleResult,
   type Session,
+  type WorkspaceSummary,
 } from './types';
 import {
   downloadFile,
@@ -74,12 +81,22 @@ const pageTitles: Record<Page, string> = {
   rooms: 'Rooms',
   groups: 'Student groups',
   settings: 'Settings',
+  availability: 'My availability',
+  audit: 'Audit history',
+  workspaces: 'Workspaces',
+  reports: 'Reports',
 };
 
 type SessionState =
   | { status: 'loading' }
   | { status: 'auth'; error?: string }
   | { status: 'ready'; user: AuthUser; workspace: SavedWorkspace; remote: boolean; revision: number; warning: string };
+
+const emptyWorkspace: SavedWorkspace = {
+  version: 1,
+  data: { courses: [], faculty: [], rooms: [], groups: [], preferences: { days: [0, 1, 2, 3, 4], preferMorning: false, balancedDays: false, avoidLastPeriod: false, avoidGaps: false, avoidFirstPeriod: false, balanceFacultyLoad: false } },
+  schedule: null,
+};
 
 function App() {
   const [session, setSession] = useState<SessionState>({ status: 'loading' });
@@ -89,9 +106,10 @@ function App() {
       setSession({ status: 'auth' });
       return;
     }
-    Promise.all([currentUser(), getRemoteWorkspace()]).then(async ([user, remote]) => {
+    currentUser().then(async user => {
+      const remote = user.role === 'admin' || user.role === 'planner' ? await getRemoteWorkspace() : null;
       const published = ['faculty', 'student', 'viewer'].includes(user.role) ? await getPublishedWorkspace() : null;
-      setSession({ status: 'ready', user, workspace: published ?? remote.workspace, revision: remote.revision, remote: true, warning: published ? 'Viewing the latest published timetable.' : '' });
+      setSession({ status: 'ready', user, workspace: published ?? remote?.workspace ?? emptyWorkspace, revision: published ? 0 : remote?.revision ?? 0, remote: true, warning: published ? 'Viewing the latest published timetable.' : remote ? '' : 'No timetable has been published for this workspace yet.' });
     }).catch(error => {
       clearAuthToken();
       setSession({ status: 'auth', error: error instanceof Error ? error.message : 'Your session expired. Please sign in again.' });
@@ -99,9 +117,9 @@ function App() {
   }, []);
 
   async function enterRemote(user: AuthUser) {
-    const remote = await getRemoteWorkspace();
     const published = ['faculty', 'student', 'viewer'].includes(user.role) ? await getPublishedWorkspace() : null;
-    setSession({ status: 'ready', user, workspace: published ?? remote.workspace, revision: remote.revision, remote: true, warning: published ? 'Viewing the latest published timetable.' : '' });
+    const remote = user.role === 'admin' || user.role === 'planner' ? await getRemoteWorkspace() : null;
+    setSession({ status: 'ready', user, workspace: published ?? remote?.workspace ?? emptyWorkspace, revision: published ? 0 : remote?.revision ?? 0, remote: true, warning: published ? 'Viewing the latest published timetable.' : remote ? '' : 'No timetable has been published for this workspace yet.' });
   }
 
   function enterOffline() {
@@ -124,6 +142,8 @@ function App() {
 function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user, remote, onLogout }: { initialWorkspace: SavedWorkspace; initialRevision: number; initialWarning: string; user: AuthUser; remote: boolean; onLogout: () => Promise<void> }) {
   const [workspace, setWorkspace] = useState<SavedWorkspace>(initialWorkspace);
   const [page, setPage] = useState<Page>('overview');
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [workspaceError, setWorkspaceError] = useState('');
   const [editor, setEditor] = useState<EditorState>(null);
   const [sessionEditor, setSessionEditor] = useState<SessionEditorState>(null);
   const [notice, setNotice] = useState(initialWarning);
@@ -140,6 +160,11 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
   const viewCourseIds = new Set(scopedCourses.map(course => course.id));
   const viewSchedule = workspace.schedule && scopedCourses.length !== workspace.data.courses.length ? { ...workspace.schedule, sessions: workspace.schedule.sessions.filter(session => viewCourseIds.has(session.courseId)), unscheduled: workspace.schedule.unscheduled.filter(item => viewCourseIds.has(item.courseId)) } : workspace.schedule;
 
+  useEffect(() => {
+    if (!remote) return;
+    void listWorkspaces().then(setWorkspaces).catch(reason => setWorkspaceError(reason instanceof Error ? reason.message : 'Workspaces could not be loaded.'));
+  }, [remote]);
+
   function persist(next: SavedWorkspace) {
     setWorkspace(next);
     try {
@@ -148,6 +173,21 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
       setNotice('The workspace is updated for this session, but could not be saved locally.');
     }
     if (remote) syncRef.current = syncRef.current.then(() => saveRemoteWorkspace(next, revisionRef.current)).then(result => { revisionRef.current = result.revision; }).catch(error => setNotice(error instanceof Error ? `Saved locally, but server sync failed: ${error.message}` : 'Saved locally, but server sync failed.'));
+  }
+
+  async function switchWorkspace(id: number) {
+    if (!remote || id === undefined) return;
+    try {
+      setActiveWorkspaceId(id);
+      const published = ['faculty', 'student', 'viewer'].includes(user.role) ? await getPublishedWorkspace() : null;
+      const next = canEdit ? await getRemoteWorkspace() : null;
+      setWorkspace(published ?? next?.workspace ?? emptyWorkspace);
+      revisionRef.current = published ? 0 : next?.revision ?? 0;
+      setPage('overview');
+      setNotice(published ? 'Switched to the latest published timetable.' : next ? 'Workspace switched.' : 'No timetable has been published for this workspace yet.');
+    } catch (reason) {
+      setWorkspaceError(reason instanceof Error ? reason.message : 'Workspace could not be opened.');
+    }
   }
 
   function updateData(data: CollegeData, message = 'Changes saved. Generate a new timetable when ready.') {
@@ -204,7 +244,7 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
       return;
     }
     setAiGenerating(true);
-    setNotice('OpenAI is proposing a timetable. ISchedule will validate it before saving…');
+    setNotice('ISchedule AI is ranking courses. The scheduler will validate every placement before saving…');
     try {
       const schedule = await generateAiSchedule(workspace.data, workspace.schedule);
       persist({ ...workspace, schedule });
@@ -287,6 +327,10 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
     window.print();
   }
 
+  // Kept as compatibility helpers for the legacy board while PlanningBoard owns the live UI.
+  void exportSchedule;
+  void printSchedule;
+
   function updateSchedule(sessions: Session[], message: string) {
     persist({ ...workspace, schedule: summarizeSchedule(workspace.data, sessions) });
     setNotice(message);
@@ -323,12 +367,20 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
       return <Overview data={viewData} schedule={viewSchedule} onNavigate={openPage} onGenerate={generate} canEdit={canEdit} />;
     }
     if (page === 'timetable') {
-      return <Timetable data={viewData} schedule={viewSchedule} onGenerate={generate} onExport={exportSchedule} onExportCalendar={exportCalendar} onPrint={printSchedule} onEditSession={setSessionEditor} onAddSession={addSession} canEdit={canEdit} generating={generating} progress={progress} />;
+      return <PlanningBoard data={viewData} schedule={viewSchedule} term={workspace.term} onGenerate={generate} onEditSession={setSessionEditor} onAddSession={addSession} onSessionsChange={updateSchedule} canEdit={canEdit} generating={generating} progress={progress} />;
     }
     if (page === 'settings') {
       return <SettingsPage data={workspace.data} onChange={updateData} onImport={() => importRef.current?.click()} onExport={exportBackup} onReset={resetDemo} canEdit={canEdit} />;
     }
-    return <ResourceList kind={page} data={workspace.data} schedule={workspace.schedule} onAdd={() => setEditor({ kind: page })} onEdit={id => setEditor({ kind: page, id })} onDelete={id => deleteResource(page, id)} canEdit={canEdit} />;
+    if (page === 'availability') return <FacultyAvailability />;
+    if (page === 'audit') return <AuditLog />;
+    if (page === 'workspaces') return <WorkspaceManager workspaces={workspaces} error={workspaceError} onSwitch={switchWorkspace} onCreated={id => { setActiveWorkspaceId(id); void switchWorkspace(id); }} canEdit={canEdit} />;
+    if (page === 'reports') return <PlanningReports data={viewData} schedule={viewSchedule} />;
+    if (['courses', 'faculty', 'rooms', 'groups'].includes(page)) {
+      const kind = page as ResourceKind;
+      return <ResourceList kind={kind} data={workspace.data} schedule={workspace.schedule} onAdd={() => setEditor({ kind })} onEdit={id => setEditor({ kind, id })} onDelete={id => deleteResource(kind, id)} canEdit={canEdit} />;
+    }
+    return null;
   };
 
   return (
@@ -340,10 +392,17 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
           {navigation.map(item => <NavButton key={item.id} item={item} active={page === item.id} onClick={() => openPage(item.id)} />)}
         </nav>
         <div className="sidebar-label resource-label">Manage</div>
-         {canEdit && <nav className="nav-list" aria-label="Resource navigation">
-           {resourceNavigation.map(item => <NavButton key={item.id} item={item} active={page === item.id} onClick={() => openPage(item.id)} />)}
-         </nav>}
-        <div className="sidebar-spacer" />
+          {canEdit && <nav className="nav-list" aria-label="Resource navigation">
+            {resourceNavigation.map(item => <NavButton key={item.id} item={item} active={page === item.id} onClick={() => openPage(item.id)} />)}
+          </nav>}
+         <div className="sidebar-label resource-label">Tools</div>
+         <nav className="nav-list" aria-label="Planning tools">
+           <NavButton item={{ id: 'reports', label: 'Reports', icon: ClipboardList }} active={page === 'reports'} onClick={() => openPage('reports')} />
+           {user.role === 'faculty' && <NavButton item={{ id: 'availability', label: 'My availability', icon: CalendarDays }} active={page === 'availability'} onClick={() => openPage('availability')} />}
+           {canEdit && <NavButton item={{ id: 'workspaces', label: 'Workspaces', icon: Users }} active={page === 'workspaces'} onClick={() => openPage('workspaces')} />}
+           {user.role === 'admin' && <NavButton item={{ id: 'audit', label: 'Audit history', icon: FileText }} active={page === 'audit'} onClick={() => openPage('audit')} />}
+         </nav>
+         <div className="sidebar-spacer" />
          {canEdit && <button className={`nav-button ${page === 'settings' ? 'active' : ''}`} onClick={() => openPage('settings')}><Settings2 size={18} /><span>Settings</span></button>}
        <div className="sidebar-footer"><span className="status-dot" /> {remote ? 'Shared workspace' : 'Local workspace'}<br /><small>{remote ? 'Synced to ISchedule server' : 'Saved on this device'}</small></div>
       </aside>
@@ -354,7 +413,7 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
           <div className="topbar-actions">
             <button className="button secondary topbar-backup" onClick={exportBackup}><Download size={16} /> Backup</button>
             {workspace.schedule && <button className="button secondary topbar-backup" onClick={exportCalendar}>ICS</button>}
-            {canEdit && <button className="button secondary" onClick={() => void generateWithAi()} disabled={aiGenerating || generating} title={remote ? 'Generate and validate a timetable with OpenAI' : 'AI planning requires a shared workspace'}><Sparkles size={16} /> {aiGenerating ? 'AI planning…' : 'AI plan'}</button>}
+             {canEdit && <button className="button secondary" onClick={() => void generateWithAi()} disabled={aiGenerating || generating} title={remote ? 'Generate and validate a timetable with the configured local AI provider' : 'AI planning requires a shared workspace'}><Sparkles size={16} /> {aiGenerating ? 'AI planning…' : 'AI plan'}</button>}
             <span className="account-chip"><span className="account-avatar">{user.name.split(' ').map(part => part[0]).slice(0, 2).join('')}</span><span><strong>{user.name}</strong><small>{user.role}</small></span></span>
             <button className="icon-button account-logout" onClick={() => void onLogout()} aria-label="Sign out" title="Sign out"><LogOut size={16} /></button>
             <button className="button primary" onClick={generate} disabled={!canEdit || generating || !workspace.data.courses.length}><Sparkles size={16} /> {generating ? `Generating ${progress}%` : 'Generate timetable'}</button>
@@ -362,7 +421,8 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
         </header>
         <div className="content-wrap">
           {notice && <div className={`notice ${notice.includes('successfully') || notice.includes('saved') || notice.includes('downloaded') || notice.includes('restored') ? 'success' : 'info'}`} role="status"><span>{notice}</span><button className="notice-close" aria-label="Dismiss message" onClick={() => setNotice('')}><X size={16} /></button></div>}
-          {renderPage()}
+           {renderPage()}
+           {canEdit && page === 'settings' && <BulkImport data={workspace.data} onImport={data => updateData(data, 'Bulk CSV import applied. Generate a new timetable to apply the changes.')} />}
           {remote && user.role === 'admin' && page === 'settings' && <><AdminUsers data={workspace.data} /><AdminWorkspaceControls /></>}
         </div>
       </main>
@@ -425,6 +485,8 @@ function Timetable({ data, schedule: scheduleResult, onGenerate, onExport, onExp
   </div>;
 }
 
+void Timetable;
+
 function TimetableBoard({ data, schedule, onGenerate, onExport, onExportCalendar, onPrint, onEditSession, onAddSession, canEdit, generating, progress }: { data: CollegeData; schedule: ScheduleResult | null; onGenerate: () => void; onExport: () => void; onExportCalendar: () => void; onPrint: () => void; onEditSession: (session: Session) => void; onAddSession: () => void; canEdit: boolean; generating: boolean; progress: number }) {
   void onExportCalendar;
   const sessions = schedule?.sessions ?? [];
@@ -463,16 +525,64 @@ function SettingsPage({ data, onChange, onImport, onExport, onReset, canEdit }: 
     if (!days.length) return;
     onChange({ ...data, preferences: { ...preferences, days } }, 'Teaching days updated. Generate a new timetable to apply the preference.');
   }
-  function togglePreference(key: 'preferMorning' | 'balancedDays' | 'avoidLastPeriod' | 'avoidGaps') {
+  function togglePreference(key: 'preferMorning' | 'balancedDays' | 'avoidLastPeriod' | 'avoidGaps' | 'avoidFirstPeriod' | 'balanceFacultyLoad') {
     onChange({ ...data, preferences: { ...preferences, [key]: !preferences[key] } }, 'Scheduling preference updated.');
   }
-  const preferenceRows: { key: 'preferMorning' | 'balancedDays' | 'avoidLastPeriod' | 'avoidGaps'; label: string; description: string }[] = [
+  const preferenceRows: { key: 'preferMorning' | 'balancedDays' | 'avoidLastPeriod' | 'avoidGaps' | 'avoidFirstPeriod' | 'balanceFacultyLoad'; label: string; description: string }[] = [
     { key: 'preferMorning', label: 'Prefer morning classes', description: 'Place more classes before the lunch break when possible.' },
     { key: 'balancedDays', label: 'Balance student days', description: 'Spread each group’s classes across the week instead of stacking them.' },
     { key: 'avoidLastPeriod', label: 'Avoid the last period', description: 'Use the final period only when it helps complete the timetable.' },
     { key: 'avoidGaps', label: 'Reduce empty gaps', description: 'Prefer compact student days with fewer long breaks between classes.' },
+    { key: 'avoidFirstPeriod', label: 'Avoid the first period', description: 'Use the first period only when the timetable needs it.' },
+    { key: 'balanceFacultyLoad', label: 'Balance faculty load', description: 'Spread teaching periods across the available days.' },
   ];
   return <div className="page-stack"><div className="page-intro"><div><p className="eyebrow">Workspace preferences</p><h2>Settings</h2><p className="muted">Shape how Campusly builds a timetable for your campus.</p></div></div><div className="settings-grid"><section className="card settings-card"><div className="card-heading"><div><h3>Teaching days</h3><p>Choose the days available for regular classes.</p></div><CalendarDays size={18} className="muted-icon" /></div><div className="day-toggle-grid">{DAYS.map((day, index) => <button key={day} className={`day-toggle ${preferences.days.includes(index) ? 'selected' : ''}`} onClick={() => toggleDay(index)}><span>{preferences.days.includes(index) ? <Check size={16} /> : null}</span>{day}</button>)}</div></section><section className="card settings-card"><div className="card-heading"><div><h3>Scheduling preferences</h3><p>Soft preferences guide the AI without breaking hard constraints.</p></div><Sparkles size={18} className="muted-icon" /></div><div className="preference-list">{preferenceRows.map(row => <button className="preference-row" key={row.key} onClick={() => togglePreference(row.key)}><span className={`toggle ${preferences[row.key] ? 'on' : ''}`}><span /></span><span><strong>{row.label}</strong><small>{row.description}</small></span></button>)}</div></section><section className="card settings-card backup-card"><div className="card-heading"><div><h3>Backup and restore</h3><p>Keep a portable copy of all resources and the latest timetable.</p></div><FileJson size={18} className="muted-icon" /></div><div className="settings-actions"><button className="button secondary" onClick={onExport}><Download size={16} /> Export JSON</button><button className="button secondary" onClick={onImport}><Upload size={16} /> Import JSON</button></div></section><section className="card settings-card danger-card"><div className="card-heading"><div><h3>Sample workspace</h3><p>Load a fresh set of courses, faculty, rooms, and groups for a quick demo.</p></div></div><button className="button secondary" onClick={onReset}>Restore sample data</button></section></div></div>;
+}
+
+function FacultyAvailability() {
+  const [faculty, setFaculty] = useState<CollegeData['faculty'][number] | null>(null);
+  const [revision, setRevision] = useState(0);
+  const [unavailable, setUnavailable] = useState<string[]>([]);
+  const [preferred, setPreferred] = useState<string[]>([]);
+  const [message, setMessage] = useState('Loading your availability…');
+  useEffect(() => { getAvailability().then(result => { setFaculty(result.faculty); setRevision(result.revision); setUnavailable(result.faculty.unavailable); setPreferred(result.faculty.preferred ?? []); setMessage(''); }).catch(reason => setMessage(reason instanceof Error ? reason.message : 'Availability could not be loaded.')); }, []);
+  function toggle(slot: string, target: 'unavailable' | 'preferred') {
+    const current = target === 'unavailable' ? unavailable : preferred;
+    const next = current.includes(slot) ? current.filter(item => item !== slot) : [...current, slot];
+    if (target === 'unavailable') { setUnavailable(next); setPreferred(value => value.filter(item => !next.includes(item))); }
+    else { setPreferred(next); setUnavailable(value => value.filter(item => !next.includes(item))); }
+  }
+  async function save() {
+    try { const result = await saveAvailability(unavailable, preferred, revision); setFaculty(result.faculty); setRevision(result.revision); setMessage('Availability saved.'); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Availability could not be saved.'); }
+  }
+  if (!faculty && message.startsWith('Loading')) return <section className="card"><p className="muted">{message}</p></section>;
+  return <div className="page-stack"><div className="page-intro"><div><p className="eyebrow">Faculty self-service</p><h2>My availability</h2><p className="muted">Mark unavailable periods and preferred teaching slots. Saving is blocked when it would conflict with a timetable.</p></div><button className="button primary" onClick={() => void save()} disabled={!faculty}>Save availability</button></div>{message && <div className={`notice ${message.includes('saved') ? 'success' : 'info'}`} role="status">{message}</div>}<section className="card availability"><div className="availability-key"><span><i className="unavailable-key" /> Unavailable</span><span><i className="preferred-key" /> Preferred</span></div><div className="availability-scroll"><table><thead><tr><th scope="col">Period</th>{DAYS.map(day => <th key={day} scope="col">{day.slice(0, 3)}</th>)}</tr></thead><tbody>{PERIODS.map((period, p) => <tr key={period.start}><th scope="row">{period.start}</th>{DAYS.map((day, d) => { const slot = `${d}-${p}`; const blocked = unavailable.includes(slot); const favored = preferred.includes(slot); return <td key={day}><button type="button" className={`availability-slot ${blocked ? 'blocked' : favored ? 'preferred' : ''}`} aria-label={`${day} ${period.start}`} aria-pressed={blocked || favored} onClick={() => toggle(slot, blocked ? 'unavailable' : favored ? 'preferred' : 'preferred')}>{blocked ? '−' : favored ? '★' : '✓'}</button></td>; })}</tr>)}</tbody></table></div></section></div>;
+}
+
+function AuditLog() {
+  const [entries, setEntries] = useState<{ actor: string; action: string; details: string; createdAt: string }[]>([]);
+  const [error, setError] = useState('');
+  useEffect(() => { listAudit().then(setEntries).catch(reason => setError(reason instanceof Error ? reason.message : 'Audit history could not be loaded.')); }, []);
+  return <div className="page-stack"><div className="page-intro"><div><p className="eyebrow">Administrator controls</p><h2>Audit history</h2><p className="muted">Recent changes in workspace {getActiveWorkspaceId()}.</p></div></div>{error && <div className="notice error" role="alert">{error}</div>}<section className="card resource-card">{entries.length ? <div className="table-scroll"><table className="resource-table"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>{entries.map((entry, index) => <tr key={`${entry.createdAt}-${index}`}><td>{new Date(entry.createdAt).toLocaleString()}</td><td>{entry.actor}</td><td>{entry.action}</td><td><code>{entry.details}</code></td></tr>)}</tbody></table></div> : <p className="muted">No audit events recorded yet.</p>}</section></div>;
+}
+
+function WorkspaceManager({ workspaces, error, onSwitch, onCreated, canEdit }: { workspaces: WorkspaceSummary[]; error: string; onSwitch: (id: number) => void; onCreated: (id: number) => void; canEdit: boolean }) {
+  const [name, setName] = useState('');
+  const [academicYear, setAcademicYear] = useState('2026–27');
+  const [semester, setSemester] = useState('Semester 1');
+  const [department, setDepartment] = useState('Computer Science');
+  const [startDate, setStartDate] = useState('2026-07-01');
+  const [endDate, setEndDate] = useState('2026-12-31');
+  const [timeZone, setTimeZone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
+  const [message, setMessage] = useState('');
+  async function create() {
+    if (!name.trim()) return;
+    const term: AcademicTerm = { academicYear, semester, department, startDate, endDate, timeZone };
+    try { const result = await createWorkspace({ name: name.trim(), term, sourceWorkspaceId: getActiveWorkspaceId(), copySchedule: false }); setName(''); setMessage('Workspace created.'); onCreated(result.id); }
+    catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Workspace could not be created.'); }
+  }
+  return <div className="page-stack"><div className="page-intro"><div><p className="eyebrow">Academic organization</p><h2>Workspaces</h2><p className="muted">Keep semesters, departments, and section schedules isolated from each other.</p></div></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice info" role="status">{message}</div>}<section className="card resource-card"><div className="admin-user-list">{workspaces.map(item => <div className="admin-user-row" key={item.id}><div className="admin-user-identity"><span className="type-badge published">#{item.id}</span><span><strong>{item.name}</strong><small>{item.term ? `${item.term.academicYear} · ${item.term.semester} · ${item.term.department}` : 'No academic term configured'}</small></span></div><button className="table-action" onClick={() => onSwitch(item.id)}>Open</button></div>)}</div></section>{canEdit && <section className="card settings-card"><div className="card-heading"><div><h3>Create a workspace</h3><p>New workspaces start with sample resources and an empty timetable.</p></div></div><div className="form-grid"><label className="span-2">Workspace name<input value={name} onChange={event => setName(event.target.value)} maxLength={120} placeholder="CSE · Semester 3 · 2026–27" /></label><label>Academic year<input value={academicYear} onChange={event => setAcademicYear(event.target.value)} /></label><label>Semester<input value={semester} onChange={event => setSemester(event.target.value)} /></label><label>Department<input value={department} onChange={event => setDepartment(event.target.value)} /></label><label>Time zone<input value={timeZone} onChange={event => setTimeZone(event.target.value)} /></label><label>Term starts<input type="date" value={startDate} onChange={event => setStartDate(event.target.value)} /></label><label>Term ends<input type="date" value={endDate} onChange={event => setEndDate(event.target.value)} /></label></div><div className="modal-footer"><button className="button primary" onClick={() => void create()} disabled={!name.trim()}>Create workspace</button></div></section>}</div>;
 }
 
 function AdminUsers({ data }: { data: CollegeData }) {

@@ -5,5 +5,7 @@ server/data/
 *.tsbuildinfo
 playwright-report/
 test-results/
+coverage/
+.e2e-data/
 .env*
 !.env.example

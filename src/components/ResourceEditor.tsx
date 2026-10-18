@@ -2,9 +2,15 @@ import { useState, type FormEvent } from 'react';
 import { COLORS, DAYS, PERIODS, newId, type CollegeData, type Course, type Faculty, type Room, type StudentGroup } from '../types';
 import { dataIssues } from '../workspace';
 import Modal from './Modal';
+import './resources.css';
 
 export type ResourceKind = 'courses' | 'faculty' | 'rooms' | 'groups';
 export const singular: Record<ResourceKind, string> = { courses: 'course', faculty: 'faculty member', rooms: 'room', groups: 'student group' };
+
+function commaList(value: string): string[] | undefined {
+  const values = value.split(',').map(item => item.trim()).filter(Boolean);
+  return values.length ? [...new Set(values)] : undefined;
+}
 
 export default function ResourceEditor({ kind, id, data, onSave, onClose }: { kind: ResourceKind; id?: string; data: CollegeData; onSave: (data: CollegeData) => void; onClose: () => void }) {
   const existing = data[kind].find(row => row.id === id);
@@ -13,6 +19,7 @@ export default function ResourceEditor({ kind, id, data, onSave, onClose }: { ki
   const room = kind === 'rooms' ? existing as Room | undefined : undefined;
   const group = kind === 'groups' ? existing as StudentGroup | undefined : undefined;
   const [unavailable, setUnavailable] = useState(faculty?.unavailable ?? []);
+  const [preferred, setPreferred] = useState((faculty?.preferred ?? []).filter(slot => !(faculty?.unavailable ?? []).includes(slot)));
   const [error, setError] = useState('');
   const missing = kind === 'courses' && (!data.faculty.length || !data.groups.length);
 
@@ -24,13 +31,15 @@ export default function ResourceEditor({ kind, id, data, onSave, onClose }: { ki
     const common = { id: existing?.id ?? newId(), name: str('name') };
     const next = { ...data };
     if (kind === 'courses') {
-      const row: Course = { ...common, code: str('code'), facultyId: str('facultyId'), groupId: str('groupId'), weeklySessions: num('weeklySessions'), duration: num('duration'), roomType: str('roomType') as Course['roomType'], color: str('color') as Course['color'], requiredFeatures: course?.requiredFeatures };
+      const requiredFeatures = commaList(str('requiredFeatures'));
+      const row: Course = { ...common, code: str('code'), facultyId: str('facultyId'), groupId: str('groupId'), weeklySessions: num('weeklySessions'), duration: num('duration'), roomType: str('roomType') as Course['roomType'], color: str('color') as Course['color'], ...(requiredFeatures ? { requiredFeatures } : {}) };
       next.courses = existing ? data.courses.map(c => c.id === id ? row : c) : [...data.courses, row];
     } else if (kind === 'faculty') {
-      const row: Faculty = { ...common, email: str('email'), department: str('department'), maxDailyPeriods: num('maxDailyPeriods'), unavailable, preferred: faculty?.preferred };
+      const row: Faculty = { ...common, email: str('email'), department: str('department'), maxDailyPeriods: num('maxDailyPeriods'), unavailable, ...(preferred.length ? { preferred: preferred.filter(slot => !unavailable.includes(slot)) } : {}) };
       next.faculty = existing ? data.faculty.map(f => f.id === id ? row : f) : [...data.faculty, row];
     } else if (kind === 'rooms') {
-      const row: Room = { ...common, building: str('building'), capacity: num('capacity'), type: str('type') as Room['type'], features: room?.features };
+      const features = commaList(str('features'));
+      const row: Room = { ...common, building: str('building'), capacity: num('capacity'), type: str('type') as Room['type'], ...(features ? { features } : {}) };
       next.rooms = existing ? data.rooms.map(r => r.id === id ? row : r) : [...data.rooms, row];
     } else {
       const row: StudentGroup = { ...common, department: str('department'), size: num('size'), semester: num('semester') };
@@ -51,28 +60,37 @@ export default function ResourceEditor({ kind, id, data, onSave, onClose }: { ki
           <label>Student group<select name="groupId" defaultValue={course?.groupId ?? data.groups[0]?.id} required>{data.groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</select></label>
           <label className="span-2">Assigned faculty<select name="facultyId" defaultValue={course?.facultyId ?? data.faculty[0]?.id} required>{data.faculty.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}</select></label>
           <label>Sessions per week<input name="weeklySessions" type="number" min={1} max={5} defaultValue={course?.weeklySessions ?? 3} required /></label>
-          <label>Periods per session<select name="duration" defaultValue={course?.duration ?? 1}><option value={1}>1 period · 1 hour</option><option value={2}>2 consecutive periods</option><option value={3}>3 consecutive periods</option></select></label>
-          <label>Required room<select name="roomType" defaultValue={course?.roomType ?? 'lecture'}><option value="lecture">Lecture room</option><option value="lab">Laboratory</option></select></label>
-          <label>Timetable color<select name="color" defaultValue={course?.color ?? 'sage'}>{COLORS.map(color => <option key={color} value={color}>{color[0].toUpperCase() + color.slice(1)}</option>)}</select></label>
-          <p className="form-hint span-2">Each course meets at most once per day. Multi-period sessions stay together and never cross a break.</p>
+           <label>Periods per session<select name="duration" defaultValue={course?.duration ?? 1}><option value={1}>1 period · 1 hour</option><option value={2}>2 consecutive periods</option><option value={3}>3 consecutive periods</option></select></label>
+           <label>Required room<select name="roomType" defaultValue={course?.roomType ?? 'lecture'}><option value="lecture">Lecture room</option><option value="lab">Laboratory</option></select></label>
+           <label>Timetable color<select name="color" defaultValue={course?.color ?? 'sage'}>{COLORS.map(color => <option key={color} value={color}>{color[0].toUpperCase() + color.slice(1)}</option>)}</select></label>
+           <label className="span-2">Required room features<input name="requiredFeatures" defaultValue={course?.requiredFeatures?.join(', ')} placeholder="e.g. projector, whiteboard" /><small className="form-hint">Separate required feature labels with commas.</small></label>
+           <p className="form-hint span-2">Each course meets at most once per day. Multi-period sessions stay together and never cross a break.</p>
         </>}
         {kind === 'faculty' && <>
-          <label>Email<input name="email" type="email" defaultValue={faculty?.email} placeholder="name@college.edu" /></label>
-          <label>Department<input name="department" defaultValue={faculty?.department ?? 'Computer Science'} required maxLength={200} /></label>
-          <label>Daily teaching limit<input name="maxDailyPeriods" type="number" min={1} max={7} defaultValue={faculty?.maxDailyPeriods ?? 5} required /></label>
-          <div className="availability span-2"><h3>Weekly availability</h3><p>Click a period to mark it unavailable. <span className="unavailable-key" /> Unavailable</p>
-            <div className="availability-scroll"><table><thead><tr><th scope="col">Period</th>{DAYS.map(day => <th key={day} scope="col">{day.slice(0, 3)}</th>)}</tr></thead><tbody>{PERIODS.map((period, p) => <tr key={period.start}><th scope="row">{period.start}</th>{DAYS.map((day, d) => {
-              const key = `${d}-${p}`;
-              const blocked = unavailable.includes(key);
-              return <td key={day}><button type="button" className={blocked ? 'availability-slot blocked' : 'availability-slot'} aria-label={`${day} ${period.start} unavailable`} aria-pressed={blocked} onClick={() => setUnavailable(current => blocked ? current.filter(slot => slot !== key) : [...current, key])}>{blocked ? '−' : '✓'}</button></td>;
-            })}</tr>)}</tbody></table></div>
-          </div>
-        </>}
-        {kind === 'rooms' && <>
-          <label className="span-2">Building<input name="building" defaultValue={room?.building} placeholder="e.g. Academic Block A" required maxLength={200} /></label>
-          <label>Capacity (seats)<input name="capacity" type="number" min={1} max={1000} defaultValue={room?.capacity ?? 50} required /></label>
-          <label>Room type<select name="type" defaultValue={room?.type ?? 'lecture'}><option value="lecture">Lecture room</option><option value="lab">Laboratory</option></select></label>
-        </>}
+           <label>Email<input name="email" type="email" defaultValue={faculty?.email} placeholder="name@college.edu" /></label>
+           <label>Department<input name="department" defaultValue={faculty?.department ?? 'Computer Science'} required maxLength={200} /></label>
+           <label>Daily teaching limit<input name="maxDailyPeriods" type="number" min={1} max={7} defaultValue={faculty?.maxDailyPeriods ?? 5} required /></label>
+           <div className="availability span-2"><h3>Weekly availability</h3><p>Click a period to mark it unavailable. <span className="unavailable-key" /> Unavailable</p>
+             <div className="availability-scroll"><table><thead><tr><th scope="col">Period</th>{DAYS.map(day => <th key={day} scope="col">{day.slice(0, 3)}</th>)}</tr></thead><tbody>{PERIODS.map((period, p) => <tr key={period.start}><th scope="row">{period.start}</th>{DAYS.map((day, d) => {
+               const key = `${d}-${p}`;
+               const blocked = unavailable.includes(key);
+               return <td key={day}><button type="button" className={blocked ? 'availability-slot blocked' : 'availability-slot'} aria-label={`${day} ${period.start} unavailable`} aria-pressed={blocked} onClick={() => { setUnavailable(current => blocked ? current.filter(slot => slot !== key) : [...current, key]); if (!blocked) setPreferred(current => current.filter(slot => slot !== key)); }}>{blocked ? '−' : '✓'}</button></td>;
+             })}</tr>)}</tbody></table></div>
+             <div className="preferred-heading"><h3>Preferred periods</h3><p>Choose soft preferences only from periods that are not unavailable. <span className="preferred-key" /> Preferred</p></div>
+             <div className="availability-scroll"><table><thead><tr><th scope="col">Period</th>{DAYS.map(day => <th key={day} scope="col">{day.slice(0, 3)}</th>)}</tr></thead><tbody>{PERIODS.map((period, p) => <tr key={period.start}><th scope="row">{period.start}</th>{DAYS.map((day, d) => {
+               const key = `${d}-${p}`;
+               const selected = preferred.includes(key);
+               const blocked = unavailable.includes(key);
+               return <td key={day}><button type="button" className={`availability-slot preferred ${selected ? 'selected' : ''}`} aria-label={`${day} ${period.start} preferred`} aria-pressed={selected} disabled={blocked} onClick={() => setPreferred(current => selected ? current.filter(slot => slot !== key) : [...current, key])}>{selected ? '★' : '☆'}</button></td>;
+             })}</tr>)}</tbody></table></div>
+           </div>
+         </>}
+         {kind === 'rooms' && <>
+           <label className="span-2">Building<input name="building" defaultValue={room?.building} placeholder="e.g. Academic Block A" required maxLength={200} /></label>
+           <label>Capacity (seats)<input name="capacity" type="number" min={1} max={1000} defaultValue={room?.capacity ?? 50} required /></label>
+           <label>Room type<select name="type" defaultValue={room?.type ?? 'lecture'}><option value="lecture">Lecture room</option><option value="lab">Laboratory</option></select></label>
+           <label className="span-2">Room features<input name="features" defaultValue={room?.features?.join(', ')} placeholder="e.g. projector, whiteboard" /><small className="form-hint">Separate feature labels with commas.</small></label>
+         </>}
         {kind === 'groups' && <>
           <label className="span-2">Department<input name="department" defaultValue={group?.department ?? 'Computer Science'} required maxLength={200} /></label>
           <label>Number of students<input name="size" type="number" min={1} max={1000} defaultValue={group?.size ?? 40} required /></label>

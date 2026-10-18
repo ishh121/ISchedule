@@ -68,17 +68,52 @@ function placements(data: CollegeData, course: Course, sessions: Session[], id: 
   return options;
 }
 
-function scorePlacement(data: CollegeData, sessions: Session[], candidate: Session, random: () => number) {
+function dailyFacultyLoad(data: CollegeData, sessions: Session[], facultyId: string, day: number) {
+  return sessions.reduce((total, session) => {
+    if (session.day !== day) return total;
+    const course = data.courses.find(item => item.id === session.courseId);
+    return course?.facultyId === facultyId ? total + course.duration : total;
+  }, 0);
+}
+
+export function facultyDailyLoads(data: CollegeData, sessions: Session[], facultyId: string) {
+  return data.preferences.days.map(day => dailyFacultyLoad(data, sessions, facultyId, day));
+}
+
+function standardDeviation(values: number[]) {
+  if (!values.length) return 0;
+  const average = values.reduce((total, value) => total + value, 0) / values.length;
+  return Math.sqrt(values.reduce((total, value) => total + (value - average) ** 2, 0) / values.length);
+}
+
+export function facultyLoadPenalty(data: CollegeData, sessions: Session[], facultyId: string) {
+  return standardDeviation(facultyDailyLoads(data, sessions, facultyId));
+}
+
+export function scorePlacement(data: CollegeData, sessions: Session[], candidate: Session, random: () => number = () => 0) {
   const course = data.courses.find(c => c.id === candidate.courseId)!;
   const groupSessions = sessions.filter(s => data.courses.find(c => c.id === s.courseId)?.groupId === course.groupId && s.day === candidate.day);
   let score = random() * 2.2;
   if (data.preferences.balancedDays) score += groupSessions.reduce((n, s) => n + data.courses.find(c => c.id === s.courseId)!.duration, 0) * 2;
   if (data.preferences.preferMorning) score += candidate.period * 0.28;
+  if (data.preferences.avoidFirstPeriod && candidate.period === 0) score += 3;
   if (data.preferences.avoidLastPeriod && candidate.period + course.duration === PERIODS.length) score += 3;
   const faculty = data.faculty.find(item => item.id === course.facultyId);
   if (faculty?.preferred?.length && !faculty.preferred.includes(`${candidate.day}-${candidate.period}`)) score += 0.35;
   // Prefer adjacent classes to isolated periods, keeping student days compact.
-  if (groupSessions.some(s => s.period + data.courses.find(c => c.id === s.courseId)!.duration === candidate.period || candidate.period + course.duration === s.period)) score -= 1.4;
+  if (data.preferences.avoidGaps) {
+    const withCandidate = [...groupSessions, candidate].sort((a, b) => a.period - b.period);
+    for (let index = 1; index < withCandidate.length; index++) {
+      const previous = withCandidate[index - 1];
+      const previousCourse = data.courses.find(item => item.id === previous.courseId);
+      const gap = withCandidate[index].period - (previous.period + (previousCourse?.duration ?? 1));
+      score += Math.max(0, gap) * 0.55;
+    }
+  } else if (groupSessions.some(s => s.period + data.courses.find(c => c.id === s.courseId)!.duration === candidate.period || candidate.period + course.duration === s.period)) score -= 1.4;
+  if (data.preferences.balanceFacultyLoad) {
+    const withCandidate = [...sessions, candidate];
+    score += facultyLoadPenalty(data, withCandidate, course.facultyId) * 0.8;
+  }
   return score;
 }
 
@@ -98,11 +133,13 @@ export function scheduleQuality(data: CollegeData, sessions: Session[]) {
     if (data.preferences.balancedDays && loads.length) penalty += (Math.max(...loads) - Math.min(...loads)) * 0.7;
   }
   if (data.preferences.avoidLastPeriod) penalty += sessions.filter(s => s.period + data.courses.find(c => c.id === s.courseId)!.duration === PERIODS.length).length * 0.6;
+  if (data.preferences.avoidFirstPeriod) penalty += sessions.filter(s => s.period === 0).length * 0.6;
   if (data.preferences.preferMorning) penalty += sessions.filter(s => s.period >= 4).length * 0.12;
   if (data.preferences.avoidGaps) for (const group of data.groups) for (const day of data.preferences.days) {
     const groupSessions = sessions.filter(s => s.day === day && data.courses.find(c => c.id === s.courseId)?.groupId === group.id).sort((a, b) => a.period - b.period);
-    for (let index = 1; index < groupSessions.length; index++) penalty += Math.max(0, groupSessions[index].period - (groupSessions[index - 1].period + (data.courses.find(c => c.id === groupSessions[index - 1].courseId)?.duration ?? 1)) - 1) * 0.4;
+    for (let index = 1; index < groupSessions.length; index++) penalty += Math.max(0, groupSessions[index].period - (groupSessions[index - 1].period + (data.courses.find(c => c.id === groupSessions[index - 1].courseId)?.duration ?? 1))) * 0.4;
   }
+  if (data.preferences.balanceFacultyLoad) for (const faculty of data.faculty) penalty += facultyLoadPenalty(data, sessions, faculty.id) * 0.55;
   return Math.max(0, Math.round((sessions.length / requested) * Math.max(0, 100 - penalty)));
 }
 

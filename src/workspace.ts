@@ -1,4 +1,4 @@
-import { COLORS, DAYS, PERIODS, type CollegeData, type SavedWorkspace, type Session } from './types';
+import { COLORS, DAYS, PERIODS, type AcademicTerm, type CollegeData, type SavedWorkspace, type Session } from './types';
 import { summarizeSchedule, validateSchedule } from './scheduler';
 import { createDemoData } from './seed';
 
@@ -8,6 +8,34 @@ const object = (value: unknown): value is Record<string, unknown> => typeof valu
 const text = (value: unknown, max = 200) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
 const integer = (value: unknown, min: number, max: number) => typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
 const roomType = (value: unknown) => value === 'lecture' || value === 'lab';
+
+function validIsoDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function validTimeZone(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.trim() || value.length > 100) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Return term validation messages without requiring a complete workspace. */
+export function termIssues(value: unknown): string[] {
+  if (!object(value)) return ['Academic term must be an object.'];
+  const term = value as Partial<AcademicTerm>;
+  const issues: string[] = [];
+  if (!text(term.academicYear, 40) || !text(term.semester, 40) || !text(term.department, 120)) issues.push('Academic terms need an academic year, semester, and department.');
+  if (!validIsoDate(term.startDate) || !validIsoDate(term.endDate)) issues.push('Academic term dates must use valid YYYY-MM-DD dates.');
+  if (validIsoDate(term.startDate) && validIsoDate(term.endDate) && term.startDate > term.endDate) issues.push('Academic term startDate must be on or before endDate.');
+  if (!validTimeZone(term.timeZone)) issues.push('Academic term timeZone must be a valid IANA time zone.');
+  return [...new Set(issues)];
+}
 
 /** Validate imported and edited data before it reaches the constraint solver. */
 export function dataIssues(value: unknown): string[] {
@@ -38,13 +66,14 @@ export function dataIssues(value: unknown): string[] {
     if (course.requiredFeatures !== undefined && (!Array.isArray(course.requiredFeatures) || course.requiredFeatures.some(feature => !text(feature, 60)))) issues.push('Course room requirements must be short text labels.');
   }
   const prefs = value.preferences;
-  if (!object(prefs) || !Array.isArray(prefs.days) || !prefs.days.length || prefs.days.some(day => !integer(day, 0, DAYS.length - 1)) || new Set(prefs.days).size !== prefs.days.length || ['preferMorning', 'balancedDays', 'avoidLastPeriod'].some(key => typeof prefs[key] !== 'boolean') || (prefs.avoidGaps !== undefined && typeof prefs.avoidGaps !== 'boolean')) issues.push('Choose at least one valid teaching day and valid scheduling preferences.');
+  if (!object(prefs) || !Array.isArray(prefs.days) || !prefs.days.length || prefs.days.some(day => !integer(day, 0, DAYS.length - 1)) || new Set(prefs.days).size !== prefs.days.length || ['preferMorning', 'balancedDays', 'avoidLastPeriod'].some(key => typeof prefs[key] !== 'boolean') || ['avoidGaps', 'avoidFirstPeriod', 'balanceFacultyLoad'].some(key => prefs[key] !== undefined && typeof prefs[key] !== 'boolean')) issues.push('Choose at least one valid teaching day and valid scheduling preferences.');
   return [...new Set(issues)];
 }
 
 export function parseWorkspace(raw: string): SavedWorkspace {
   const value: unknown = JSON.parse(raw);
   if (!object(value) || value.version !== 1) throw new Error('This is not a supported ISchedule backup.');
+  if (value.term !== undefined && termIssues(value.term).length) throw new Error(termIssues(value.term)[0]);
   const issues = dataIssues(value.data);
   if (issues.length) throw new Error(issues[0]);
   const data = value.data as CollegeData;
@@ -60,7 +89,7 @@ export function parseWorkspace(raw: string): SavedWorkspace {
     if (conflicts.length) throw new Error(`Saved timetable has a conflict: ${conflicts[0].message}`);
     schedule = summarizeSchedule(data, sessions, result.generatedAt);
   }
-  return { version: 1, data, schedule };
+  return { version: 1, data, schedule, ...(value.term === undefined ? {} : { term: value.term as AcademicTerm }) };
 }
 
 export function loadWorkspace(): { workspace: SavedWorkspace; warning: string } {

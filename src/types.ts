@@ -23,12 +23,14 @@ export interface Course {
   color: Color;
   requiredFeatures?: string[];
 }
-export interface Preferences { days: number[]; preferMorning: boolean; balancedDays: boolean; avoidLastPeriod: boolean; avoidGaps?: boolean }
+export interface Preferences { days: number[]; preferMorning: boolean; balancedDays: boolean; avoidLastPeriod: boolean; avoidGaps?: boolean; avoidFirstPeriod?: boolean; balanceFacultyLoad?: boolean }
 export interface CollegeData { courses: Course[]; faculty: Faculty[]; rooms: Room[]; groups: StudentGroup[]; preferences: Preferences }
 export interface Session { id: string; courseId: string; day: number; period: number; roomId: string; locked?: boolean }
 export interface ScheduleResult { sessions: Session[]; unscheduled: { courseId: string; count: number; reason: string }[]; quality: number; generatedAt: string }
-export interface SavedWorkspace { version: 1; data: CollegeData; schedule: ScheduleResult | null }
-export type Page = 'overview' | 'timetable' | 'courses' | 'faculty' | 'rooms' | 'groups' | 'settings';
+export interface AcademicTerm { academicYear: string; semester: string; department: string; startDate: string; endDate: string; timeZone: string }
+export interface SavedWorkspace { version: 1; data: CollegeData; schedule: ScheduleResult | null; term?: AcademicTerm }
+export interface WorkspaceSummary { id: number; name: string; term?: AcademicTerm }
+export type Page = 'overview' | 'timetable' | 'courses' | 'faculty' | 'rooms' | 'groups' | 'settings' | 'availability' | 'audit' | 'workspaces' | 'reports';
 export const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
 export const PERIODS = [
   { start: '09:00', end: '10:00', label: '09:00 AM' },
