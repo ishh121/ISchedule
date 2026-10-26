@@ -67,6 +67,7 @@ h3 { font-size: 15px; letter-spacing: -0.015em; }
 .text-button:hover { color: #245a49; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 15px; box-shadow: var(--shadow); }
 .card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.history-heading { margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--line); }
 .card-heading p { margin-top: 6px; color: var(--muted); font-size: 12px; }
 .heading-icon, .muted-icon { color: #a3b0a8; }
 .notice { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border: 1px solid #dce9e2; border-radius: 10px; color: #426858; background: #f1f8f3; font-size: 12px; line-height: 1.45; }

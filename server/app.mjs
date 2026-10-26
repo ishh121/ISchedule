@@ -294,7 +294,7 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     response.end(JSON.stringify(value));
   };
   function publishedFor(user, workspaceId, workspace) {
-    if (user.role === 'admin' || user.role === 'planner') return workspace;
+    if (user.role === 'admin' || user.role === 'planner' || user.role === 'viewer') return workspace;
     const link = linkFor(user, workspaceId);
     if (user.role === 'faculty' && !link.facultyId) return null;
     if (user.role === 'student' && !link.groupId) return null;
@@ -627,7 +627,8 @@ export function createApplication({ dataDirectory, publicDirectory, publicOrigin
     if (path === '/api/history/restore' && request.method === 'POST') {
       requireRole(user, ['admin']);
       const value = await readBody(request);
-      const entry = db.prepare('SELECT payload FROM workspace_history WHERE workspaceId=? AND revision=?').get(workspaceId, value.targetRevision ?? -1);
+      if (!Number.isSafeInteger(value.targetRevision) || value.targetRevision < 1) throw httpError(400, 'targetRevision must be a positive integer.');
+      const entry = db.prepare('SELECT payload FROM workspace_history WHERE workspaceId=? AND revision=?').get(workspaceId, value.targetRevision);
       if (!entry) throw httpError(404, 'Saved version not found.');
       return send(response, 200, save(workspaceId, JSON.parse(entry.payload), value.revision, user));
     }

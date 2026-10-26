@@ -189,6 +189,56 @@ describe('published, versions, and history isolation', () => {
     expect(published.body.version.payload.data.courses.every((course: { facultyId: string }) => course.facultyId === facultyId)).toBe(true);
     expect(published.body.version.payload.data.courses.length).toBeLessThan(workspace.body.workspace.data.courses.length);
   });
+
+  it('shows the published timetable to viewers without exposing the draft workspace', async () => {
+    const owner = await register('viewer-publication-owner@example.test');
+    const ownerCookie = owner.cookie!;
+    const current = await populateWorkspace(ownerCookie);
+    const schedule = generateSchedule(current.body.workspace.data, undefined, 13, 8);
+    const saved = await json('/api/workspace', ownerCookie, 'PUT', { workspace: { ...current.body.workspace, schedule }, revision: current.body.revision });
+    expect(saved.response.status).toBe(200);
+
+    const viewer = await register('published-viewer@example.test');
+    expect((await json('/api/published', viewer.cookie!)).body.version).toBeNull();
+    const version = await json('/api/versions', ownerCookie, 'POST', { name: 'Viewer timetable' });
+    expect((await json(`/api/versions/${version.body.id}/publish`, ownerCookie, 'POST', {})).response.status).toBe(200);
+
+    const published = await json('/api/published', viewer.cookie!);
+    expect(published.response.status).toBe(200);
+    expect(published.body.version.payload.data.courses).toHaveLength(saved.body.workspace.data.courses.length);
+    expect(published.body.version.payload.schedule.sessions).toHaveLength(schedule.sessions.length);
+    expect((await json('/api/workspace', viewer.cookie!)).response.status).toBe(403);
+  });
+
+  it('lists history and restores an older draft as a new revision', async () => {
+    const owner = await register('history-owner@example.test');
+    const ownerCookie = owner.cookie!;
+    const first = await populateWorkspace(ownerCookie);
+    const changed = JSON.parse(JSON.stringify(first.body.workspace));
+    changed.data.preferences.avoidFirstPeriod = true;
+    const second = await json('/api/workspace', ownerCookie, 'PUT', { workspace: changed, revision: first.body.revision });
+    expect(second.body.revision).toBe(2);
+
+    const history = await json('/api/history', ownerCookie);
+    expect(history.response.status).toBe(200);
+    expect(history.body.history.map((entry: { revision: number }) => entry.revision)).toEqual([2, 1]);
+    expect(history.body.history.every((entry: { payload?: unknown }) => entry.payload === undefined)).toBe(true);
+
+    const restored = await json('/api/history/restore', ownerCookie, 'POST', { targetRevision: 1, revision: 2 });
+    expect(restored.response.status).toBe(200);
+    expect(restored.body.revision).toBe(3);
+    expect(restored.body.workspace).toEqual(first.body.workspace);
+
+    const stale = await json('/api/history/restore', ownerCookie, 'POST', { targetRevision: 2, revision: 2 });
+    expect(stale.response.status).toBe(409);
+    const latest = await json('/api/workspace', ownerCookie);
+    expect(latest.body.revision).toBe(3);
+    expect(latest.body.workspace).toEqual(first.body.workspace);
+
+    const viewer = await register('history-viewer@example.test');
+    expect((await json('/api/history', viewer.cookie!)).response.status).toBe(403);
+    expect((await json('/api/history/restore', viewer.cookie!, 'POST', { targetRevision: 1, revision: 3 })).response.status).toBe(403);
+  });
 });
 
 describe('faculty availability and audit', () => {

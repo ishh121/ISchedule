@@ -61,6 +61,11 @@ export async function createInvitation(email: string, role: UserRole) { return r
 export async function listVersions() { return (await request<{ versions: { id: number; name: string; revision: number; published: number; createdBy: string; createdAt: string }[] }>('/api/versions')).versions; }
 export async function createVersion(name: string) { return request<{ id: number }>('/api/versions', { method: 'POST', body: JSON.stringify({ name }) }); }
 export async function publishVersion(id: number) { await request(`/api/versions/${id}/publish`, { method: 'POST', body: '{}' }); }
+export type HistoryEntry = { revision: number; actor: string; savedAt: string };
+export async function listHistory(): Promise<HistoryEntry[]> { return (await request<{ history: HistoryEntry[] }>('/api/history')).history; }
+export async function restoreHistory(targetRevision: number, revision: number) {
+  return request<{ workspace: SavedWorkspace; revision: number }>('/api/history/restore', { method: 'POST', body: JSON.stringify({ targetRevision, revision }) });
+}
 export async function listAudit() { return (await request<{ audit: { actor: string; action: string; details: string; createdAt: string }[] }>('/api/audit')).audit; }
 export async function getAvailability(): Promise<{ faculty: Faculty; revision: number }> { return request<{ faculty: Faculty; revision: number }>('/api/availability'); }
 export async function saveAvailability(unavailable: string[], preferred: string[], revision: number): Promise<{ faculty: Faculty; revision: number }> {

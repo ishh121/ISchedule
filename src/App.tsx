@@ -29,7 +29,7 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import ResourceEditor, { singular, type ResourceKind } from './components/ResourceEditor';
 import SessionEditor from './components/SessionEditor';
-import { clearAuthToken, createInvitation, createVersion, createWorkspace, currentUser, generateAiSchedule, getActiveWorkspaceId, getAvailability, getPublishedWorkspace, getRemoteWorkspace, hasAuthToken, listAudit, listUsers, listVersions, listWorkspaces, login, logout, publishVersion, register, requestPasswordReset, resetPassword, resetUserPassword, saveAvailability, saveRemoteWorkspace, setActiveWorkspaceId, updateUserRole, verifyEmail, type AuthUser, type UserRole } from './api';
+import { clearAuthToken, createInvitation, createVersion, createWorkspace, currentUser, generateAiSchedule, getActiveWorkspaceId, getAvailability, getPublishedWorkspace, getRemoteWorkspace, hasAuthToken, listAudit, listHistory, listUsers, listVersions, listWorkspaces, login, logout, publishVersion, register, requestPasswordReset, resetPassword, resetUserPassword, restoreHistory, saveAvailability, saveRemoteWorkspace, setActiveWorkspaceId, updateUserRole, verifyEmail, type AuthUser, type HistoryEntry, type UserRole } from './api';
 import { exportCsv, exportIcs, summarizeSchedule } from './scheduler';
 import PlanningBoard from './components/PlanningBoard';
 import BulkImport from './components/BulkImport';
@@ -167,6 +167,17 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
       setNotice('The workspace is updated for this session, but could not be saved locally.');
     }
     if (remote) syncRef.current = syncRef.current.then(() => saveRemoteWorkspace(next, revisionRef.current)).then(result => { revisionRef.current = result.revision; }).catch(error => setNotice(error instanceof Error ? `Saved locally, but server sync failed: ${error.message}` : 'Saved locally, but server sync failed.'));
+  }
+
+  async function restoreServerHistory(targetRevision: number) {
+    if (!remote || user.role !== 'admin') throw new Error('Only remote administrators can restore workspace history.');
+    await syncRef.current;
+    const result = await restoreHistory(targetRevision, revisionRef.current);
+    setWorkspace(result.workspace);
+    revisionRef.current = result.revision;
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(result.workspace)); } catch { /* The server copy is still restored even if browser storage is unavailable. */ }
+    setNotice(`History revision ${targetRevision} restored as new revision ${result.revision}.`);
+    return result;
   }
 
   async function switchWorkspace(id: number) {
@@ -417,7 +428,7 @@ function WorkspaceApp({ initialWorkspace, initialRevision, initialWarning, user,
           {notice && <div className={`notice ${notice.includes('successfully') || notice.includes('saved') || notice.includes('downloaded') || notice.includes('restored') ? 'success' : 'info'}`} role="status"><span>{notice}</span><button className="notice-close" aria-label="Dismiss message" onClick={() => setNotice('')}><X size={16} /></button></div>}
            {renderPage()}
            {canEdit && page === 'settings' && <BulkImport data={workspace.data} onImport={data => updateData(data, 'Bulk CSV import applied. Generate a new timetable to apply the changes.')} />}
-          {remote && user.role === 'admin' && page === 'settings' && <><AdminUsers data={workspace.data} /><AdminWorkspaceControls /></>}
+           {remote && user.role === 'admin' && page === 'settings' && <><AdminUsers data={workspace.data} /><AdminWorkspaceControls onRestore={restoreServerHistory} /></>}
         </div>
       </main>
 
@@ -599,15 +610,25 @@ function AdminUsers({ data }: { data: CollegeData }) {
   return <section className="card admin-users"><div className="card-heading"><div><p className="eyebrow">Administrator controls</p><h3>Accounts and access</h3><p>Assign roles and link faculty or student accounts to workspace records.</p></div><Users size={18} className="muted-icon" /></div>{error && <div className="notice error" role="alert">{error}</div>}<div className="admin-user-list">{users.map(user => <div className="admin-user-row" key={user.id}><div className="admin-user-identity"><span className="avatar">{user.name.split(' ').map(part => part[0]).slice(0, 2).join('')}</span><span><strong>{user.name}</strong><small>{user.email}</small></span></div><select value={user.role} onChange={event => void changeRole(user, event.target.value as UserRole, user.role === 'faculty' ? user.facultyId ?? '' : user.groupId ?? '')}><option value="admin">Admin</option><option value="planner">Planner</option><option value="faculty">Faculty</option><option value="student">Student</option><option value="viewer">Viewer</option></select>{user.role === 'faculty' && <select value={user.facultyId ?? ''} onChange={event => void changeRole(user, user.role, event.target.value)}><option value="">Link faculty record…</option>{data.faculty.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select>}{user.role === 'student' && <select value={user.groupId ?? ''} onChange={event => void changeRole(user, user.role, event.target.value)}><option value="">Link student group…</option>{data.groups.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select>}<button className="table-action" onClick={() => void resetPassword(user)}>Reset password</button></div>)}</div></section>;
 }
 
-function AdminWorkspaceControls() {
+function AdminWorkspaceControls({ onRestore }: { onRestore: (targetRevision: number) => Promise<{ revision: number }> }) {
   const [versions, setVersions] = useState<{ id: number; name: string; revision: number; published: number; createdBy: string; createdAt: string }[]>([]);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [restoring, setRestoring] = useState<number | null>(null);
   const [message, setMessage] = useState('');
-  const refresh = () => { void listVersions().then(setVersions).catch(reason => setMessage(reason instanceof Error ? reason.message : 'Versions could not be loaded.')); };
-  useEffect(refresh, []);
+  async function refresh() {
+    try {
+      const [nextVersions, nextHistory] = await Promise.all([listVersions(), listHistory()]);
+      setVersions(nextVersions);
+      setHistory(nextHistory);
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : 'Workspace history could not be loaded.');
+    }
+  }
+  useEffect(() => { void refresh(); }, []);
   async function create() {
     const name = window.prompt('Name this timetable version (for example: CSE Semester 3 · 2026–27):');
     if (!name) return;
-    try { await createVersion(name); setMessage('Version saved.'); refresh(); } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Version could not be saved.'); }
+    try { await createVersion(name); setMessage('Version saved.'); await refresh(); } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Version could not be saved.'); }
   }
   async function invite() {
     const email = window.prompt('Email address to invite:');
@@ -617,9 +638,22 @@ function AdminWorkspaceControls() {
     try { const result = await createInvitation(email, role); setMessage(`Invitation created: ${result.link}`); } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Invitation could not be created.'); }
   }
   async function publish(id: number) {
-    try { await publishVersion(id); setMessage('Version published.'); refresh(); } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Version could not be published.'); }
+    try { await publishVersion(id); setMessage('Version published.'); await refresh(); } catch (reason) { setMessage(reason instanceof Error ? reason.message : 'Version could not be published.'); }
   }
-  return <section className="card admin-users"><div className="card-heading"><div><p className="eyebrow">Publishing</p><h3>Timetable versions</h3><p>Save named semester drafts and publish one version for faculty and students.</p></div><CalendarDays size={18} className="muted-icon" /></div>{message && <div className="notice info" role="status">{message}</div>}<div className="settings-actions"><button className="button secondary" onClick={create}><Plus size={16} /> Save current version</button><button className="button secondary" onClick={invite}><Users size={16} /> Invite account</button></div><div className="admin-user-list">{versions.length ? versions.map(version => <div className="admin-user-row" key={version.id}><div className="admin-user-identity"><span className={`type-badge ${version.published ? 'published' : ''}`}>{version.published ? 'Published' : 'Draft'}</span><span><strong>{version.name}</strong><small>Revision {version.revision} · {version.createdBy}</small></span></div>{!version.published && <button className="table-action" onClick={() => void publish(version.id)}>Publish</button>}</div>) : <p className="muted">No saved versions yet.</p>}</div></section>;
+  async function restore(entry: HistoryEntry) {
+    if (!window.confirm(`Restore draft revision ${entry.revision}? This creates a new current revision and does not change the published timetable.`)) return;
+    setRestoring(entry.revision);
+    try {
+      const result = await onRestore(entry.revision);
+      setMessage(`Revision ${entry.revision} restored as new revision ${result.revision}.`);
+      await refresh();
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : 'History revision could not be restored.');
+    } finally {
+      setRestoring(null);
+    }
+  }
+  return <section className="card admin-users"><div className="card-heading"><div><p className="eyebrow">Publishing</p><h3>Timetable versions</h3><p>Save named semester drafts and publish one version for faculty and students.</p></div><CalendarDays size={18} className="muted-icon" /></div>{message && <div className="notice info" role="status">{message}</div>}<div className="settings-actions"><button className="button secondary" onClick={() => void create()}><Plus size={16} /> Save current version</button><button className="button secondary" onClick={() => void invite()}><Users size={16} /> Invite account</button></div><div className="admin-user-list">{versions.length ? versions.map(version => <div className="admin-user-row" key={version.id}><div className="admin-user-identity"><span className={`type-badge ${version.published ? 'published' : ''}`}>{version.published ? 'Published' : 'Draft'}</span><span><strong>{version.name}</strong><small>Revision {version.revision} · {version.createdBy}</small></span></div>{!version.published && <button className="table-action" onClick={() => void publish(version.id)}>Publish</button>}</div>) : <p className="muted">No saved versions yet.</p>}</div><div className="card-heading history-heading"><div><h3>Workspace history</h3><p>Restore a previous draft revision. Restoring creates a new revision; it does not publish it.</p></div><RefreshCw size={18} className="muted-icon" /></div><div className="admin-user-list">{history.length ? history.map(entry => <div className="admin-user-row" key={`${entry.revision}-${entry.savedAt}`}><div className="admin-user-identity"><span className="type-badge">Revision {entry.revision}</span><span><strong>{entry.actor}</strong><small>{new Date(entry.savedAt).toLocaleString()}</small></span></div><button className="table-action" aria-label={`Restore revision ${entry.revision}`} disabled={restoring !== null} onClick={() => void restore(entry)}>Restore</button></div>) : <p className="muted">No saved history yet.</p>}</div></section>;
 }
 
 function AuthScreen({ initialError, onSignedIn, onOffline }: { initialError?: string; onSignedIn: (user: AuthUser) => Promise<void>; onOffline: () => void }) {

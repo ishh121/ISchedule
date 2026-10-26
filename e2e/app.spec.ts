@@ -90,6 +90,31 @@ test('registers the bootstrap admin and can log in again', async ({ page }) => {
   await loginAccount(page, adminAccount);
 });
 
+test('admin can review and restore draft workspace history', async ({ page }) => {
+  if (!adminAccount) throw new Error('Admin account setup did not complete.');
+  await loginAccount(page, adminAccount);
+  await page.getByRole('button', { name: /settings/i }).last().click();
+  await expect(page.locator('h2').filter({ hasText: /^Settings$/i })).toBeVisible();
+  const preference = page.getByRole('button', { name: /avoid the first period/i });
+  for (let index = 0; index < 2; index += 1) {
+    const saved = page.waitForResponse(response => response.url().includes('/api/workspace') && response.request().method() === 'PUT');
+    await preference.click();
+    expect((await saved).ok()).toBe(true);
+  }
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: /^overview$/i })).toBeVisible({ timeout: 15_000 });
+  await page.getByRole('button', { name: /settings/i }).last().click();
+  await expect(page.getByRole('heading', { name: /workspace history/i })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Restore revision 1' })).toBeVisible();
+
+  page.once('dialog', dialog => void dialog.accept());
+  const restored = page.waitForResponse(response => response.url().includes('/api/history/restore') && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Restore revision 1' }).click();
+  expect((await restored).ok()).toBe(true);
+  await expect(page.getByText(/History revision 1 restored as new revision 3/i)).toBeVisible();
+});
+
 test('viewer sees the no-published state', async ({ page }) => {
   await ensureViewerAccount(page);
   await expect(page.getByText(/no (published )?timetable|timetable .*not.*published|publish.*timetable.*first/i).first()).toBeVisible();
